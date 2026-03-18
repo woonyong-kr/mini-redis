@@ -126,7 +126,20 @@ def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     특정 인덱스의 원소를 반환합니다.
     반환: 값 (bulk string) 또는 nil (범위 초과)
     """
-    raise NotImplementedError
+    if len(args) != 2:
+        return RespError("ERR wrong number of arguments for 'LINDEX' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    try:
+        index = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.lindex(key, index)
 
 
 def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -135,4 +148,24 @@ def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     특정 인덱스의 원소를 변경합니다.
     반환: +OK 또는 오류 (인덱스 범위 초과)
     """
-    raise NotImplementedError
+    if len(args) != 3:
+        return RespError("ERR wrong number of arguments for 'LSET' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    try:
+        index = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    try:
+        store.lset(key, index, args[2])
+    except KeyError as exc:
+        return RespError(exc.args[0])
+    except IndexError as exc:
+        return RespError(exc.args[0])
+
+    return SimpleString("OK")

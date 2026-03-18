@@ -302,19 +302,50 @@ class DataStore:
         if list_obj is None:
             return []
 
-        values = list(list_obj.value)
+        values = list_obj.value
         normalized = self._normalize_range(len(values), start, stop)
         if normalized is None:
             return []
 
         range_start, range_stop = normalized
-        return values[range_start:range_stop + 1]
+        return [values[index] for index in range(range_start, range_stop + 1)]
 
     def llen(self, key: str) -> int:
         list_obj = self._get_list_object(key)
         if list_obj is None:
             return 0
         return len(list_obj.value)
+
+    def lindex(self, key: str, index: int) -> Optional[str]:
+        list_obj = self._get_list_object(key)
+        if list_obj is None:
+            return None
+
+        values = list_obj.value
+        length = len(values)
+
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            return None
+
+        return values[index]
+
+    def lset(self, key: str, index: int, value: str) -> bool:
+        list_obj = self._get_list_object(key)
+        if list_obj is None:
+            raise KeyError("ERR no such key")
+
+        values = list_obj.value
+        length = len(values)
+
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError("ERR index out of range")
+
+        values[index] = value
+        return True
 
     # ─────────────────────────────────────────
     # Set 전용 메서드
