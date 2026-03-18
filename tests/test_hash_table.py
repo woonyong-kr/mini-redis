@@ -1,6 +1,11 @@
 import pytest
 
-from store.hash_table import Hash, OpenAddressHashTable, murmurhash3_32
+from store.hash_table import (
+    ChainedHashTable,
+    Hash,
+    OpenAddressHashTable,
+    murmurhash3_32,
+)
 
 
 def _find_colliding_keys(count: int, capacity: int) -> list[str]:
@@ -122,6 +127,97 @@ class TestOpenAddressHashTable:
         assert len(table) == 2
 
 
+class TestChainedHashTable:
+    def test_insert_update_lookup_and_miss(self):
+        table = ChainedHashTable()
+
+        assert table.set("name", "mini-redis") is True
+        assert table.get("name") == "mini-redis"
+        assert table.contains("name") is True
+        assert len(table) == 1
+
+        assert table.set("name", "redis-like") is False
+        assert table.get("name") == "redis-like"
+        assert len(table) == 1
+        assert table.get("missing") is None
+
+    def test_delete_and_repeated_delete(self):
+        table = ChainedHashTable()
+        table.set("name", "mini-redis")
+
+        assert table.delete("name") is True
+        assert table.get("name") is None
+        assert len(table) == 0
+        assert table.delete("name") is False
+
+    def test_collision_chain_delete_preserves_other_entries(self):
+        table = ChainedHashTable()
+        first_key, second_key, third_key = _find_colliding_keys(3, table.capacity)
+
+        table.set(first_key, "v1")
+        table.set(second_key, "v2")
+        table.set(third_key, "v3")
+
+        assert table.delete(second_key) is True
+        assert table.get(first_key) == "v1"
+        assert table.get(second_key) is None
+        assert table.get(third_key) == "v3"
+        assert len(table) == 2
+
+    def test_collision_heavy_inserts_preserve_all_contents(self):
+        table = ChainedHashTable()
+        colliding_keys = _find_colliding_keys(5, table.capacity)
+
+        for index, key in enumerate(colliding_keys):
+            table.set(key, f"value-{index}")
+
+        for index, key in enumerate(colliding_keys):
+            assert table.get(key) == f"value-{index}"
+        assert len(table) == 5
+
+    def test_grow_resize_preserves_live_entries(self):
+        table = ChainedHashTable()
+
+        for index in range(6):
+            table.set(f"field-{index}", f"value-{index}")
+
+        assert table.capacity == 16
+        assert len(table) == 6
+        for index in range(6):
+            assert table.get(f"field-{index}") == f"value-{index}"
+
+    def test_shrink_resize_preserves_live_entries(self):
+        table = ChainedHashTable()
+
+        for index in range(6):
+            table.set(f"field-{index}", f"value-{index}")
+
+        assert table.capacity == 16
+
+        assert table.delete("field-0") is True
+        assert table.delete("field-1") is True
+        assert table.delete("field-2") is True
+
+        assert table.capacity == 8
+        assert len(table) == 3
+        for index in range(3, 6):
+            assert table.get(f"field-{index}") == f"value-{index}"
+
+    def test_repeated_delete_and_reinsert_edge_case(self):
+        table = ChainedHashTable()
+        first_key, second_key = _find_colliding_keys(2, table.capacity)
+
+        table.set(first_key, "v1")
+        table.set(second_key, "v2")
+        assert table.delete(first_key) is True
+        assert table.delete(first_key) is False
+
+        assert table.set(first_key, "v1-new") is True
+        assert table.get(first_key) == "v1-new"
+        assert table.get(second_key) == "v2"
+        assert len(table) == 2
+
+
 class TestHash:
     def test_hash_stays_compact_for_small_entries(self):
         hash_value = Hash()
@@ -137,6 +233,7 @@ class TestHash:
             hash_value.set(f"field-{index}", f"value-{index}")
 
         assert hash_value.is_compact is False
+        assert isinstance(hash_value._table, ChainedHashTable)
         assert len(hash_value) == 33
 
     def test_hash_promotes_when_value_exceeds_byte_threshold(self):
@@ -145,6 +242,7 @@ class TestHash:
         hash_value.set("field", "x" * 65)
 
         assert hash_value.is_compact is False
+        assert isinstance(hash_value._table, ChainedHashTable)
         assert hash_value.get("field") == "x" * 65
 
     def test_hash_preserves_contents_after_promotion(self):

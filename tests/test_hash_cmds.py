@@ -16,7 +16,7 @@ from commands.hash_cmds import (
 from protocol.encoder import RespError, SimpleString, encode
 from store.datastore import DataStore, TYPE_NONE
 from store.expiry import ExpiryManager
-from store.hash_table import Hash
+from store.hash_table import ChainedHashTable, Hash
 from store.redis_object import make_string
 
 
@@ -100,6 +100,7 @@ class TestHashCommands:
         hash_value = hash_obj.value
         assert isinstance(hash_value, Hash)
         assert hash_value.is_compact is False
+        assert isinstance(hash_value._table, ChainedHashTable)
         assert cmd_hlen(store, expiry, ["big-hash"]) == 33
         assert cmd_hmget(
             store, expiry, ["big-hash", "field-0", "field-16", "field-32"]
@@ -116,6 +117,7 @@ class TestHashCommands:
         hash_value = hash_obj.value
         assert isinstance(hash_value, Hash)
         assert hash_value.is_compact is False
+        assert isinstance(hash_value._table, ChainedHashTable)
         assert cmd_hget(store, expiry, ["large-hash", "field"]) == large_value
 
     def test_wrongtype_error_for_hash_commands(self, ctx):

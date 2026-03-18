@@ -20,6 +20,7 @@ mini-redis 벤치마크 봇
   6. Cache vs DB   - Redis 캐시 앞단 vs MongoDB 직접 조회
   7. Pub/Sub       - 발행-구독 메시지 전달 (실제 Redis만)
   8. Pipeline      - 파이프라인 vs 개별 요청 비교
+  9. Hash Collision - 커스텀 해시테이블 균등 분포 vs 충돌 집중 비교
 
 결과:
   - 콘솔 테이블 출력
@@ -28,6 +29,7 @@ mini-redis 벤치마크 봇
 """
 
 import os
+import sys
 import time
 import json
 import csv
@@ -36,10 +38,22 @@ import string
 import statistics
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import redis
 from pymongo import MongoClient
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from store.hash_table import (
+    BaseHashTable,
+    ChainedHashTable,
+    OpenAddressHashTable,
+    murmurhash3_32,
+)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -252,6 +266,55 @@ def rand_str(length: Optional[int] = None) -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
+def _hash_micro_entry_count() -> int:
+    # resize 노이즈보다 probe 비용을 더 잘 보기 위해 load factor를 0.5 수준으로 맞춘다.
+    return min(max(CONFIG.iterations, 256), 2048)
+
+
+def _hash_micro_capacity() -> int:
+    entry_count = _hash_micro_entry_count()
+    capacity = 8
+    while capacity < entry_count * 2:
+        capacity *= 2
+    return capacity
+
+
+def _generate_uniform_keys(count: int) -> list[str]:
+    return [f"uniform:{index:06d}" for index in range(count)]
+
+
+def _generate_colliding_keys(count: int, capacity: int, bucket: int = 0) -> list[str]:
+    keys: list[str] = []
+    candidate = 0
+
+    while len(keys) < count:
+        key = f"collision:{candidate:08d}"
+        if (murmurhash3_32(key) & (capacity - 1)) == bucket:
+            keys.append(key)
+        candidate += 1
+
+    return keys
+
+
+def _hash_impl_name(table_cls: type[BaseHashTable]) -> str:
+    if table_cls is OpenAddressHashTable:
+        return "open_address"
+    if table_cls is ChainedHashTable:
+        return "chaining"
+    return table_cls.__name__.lower()
+
+
+def _make_populated_hash_table(
+    table_cls: type[BaseHashTable],
+    keys: list[str],
+    capacity: int,
+) -> BaseHashTable:
+    table = table_cls(capacity=capacity)
+    for index, key in enumerate(keys):
+        table.set(key, f"value:{index}")
+    return table
+
+
 # ─────────────────────────────────────────────────────────────────
 # 시나리오 1: KV Cache — 단순 문자열 GET/SET
 # ─────────────────────────────────────────────────────────────────
@@ -290,32 +353,94 @@ def scenario_kv_cache_set(r: redis.Redis, service: str) -> ScenarioResult:
 # 시나리오 2: Session Store — Hash 기반 사용자 세션
 # ─────────────────────────────────────────────────────────────────
 
-def scenario_session_store(r: redis.Redis, service: str) -> ScenarioResult:
-    """
-    HSET user:{id} field value 패턴.
+def _build_session_payload(index: int) -> dict[str, str]:
+    now = str(int(time.time()))
+    return {
+        "user_id": str(index),
+        "username": f"user_{index}",
+        "email": f"user_{index}@example.com",
+        "created_at": now,
+        "last_seen": now,
+    }
 
-    실제 사용 사례: 로그인 세션 저장
-    측정 포인트:
-      - Hash 연산 레이턴시
-      - 필드 수가 많을수록 어떻게 변하는지
-    """
+
+def _preload_session_hashes(r: redis.Redis) -> list[str]:
     session_keys = []
     for i in range(CONFIG.session_count):
         key = f"session:{i:04d}"
-        r.hset(key, mapping={
-            "user_id": str(i),
-            "username": f"user_{i}",
-            "email": f"user_{i}@example.com",
-            "created_at": str(int(time.time())),
-            "last_seen": str(int(time.time())),
-        })
+        r.hset(key, mapping=_build_session_payload(i))
         session_keys.append(key)
+    return session_keys
+
+
+def scenario_session_store_read(r: redis.Redis, service: str) -> ScenarioResult:
+    """
+    HGETALL session:{id} 패턴.
+
+    실제 사용 사례: 로그인 세션 조회
+    측정 포인트:
+      - Hash 조회 레이턴시
+      - 필드 수가 많을수록 어떻게 변하는지
+    """
+    session_keys = _preload_session_hashes(r)
 
     def op():
         key = random.choice(session_keys)
         r.hgetall(key)
 
-    return run_scenario(service, "2_session_hgetall", op)
+    return run_scenario(service, "2_session_read", op)
+
+
+def scenario_session_store_update(r: redis.Redis, service: str) -> ScenarioResult:
+    """
+    HSET session:{id} last_seen ts 패턴.
+
+    실제 사용 사례: 세션 마지막 접근 시간 갱신
+    측정 포인트:
+      - Hash 단일 필드 갱신 비용
+      - 충돌/프로빙이 write-path에 미치는 영향
+    """
+    session_keys = _preload_session_hashes(r)
+
+    def op():
+        key = random.choice(session_keys)
+        r.hset(key, "last_seen", str(int(time.time())))
+
+    return run_scenario(service, "2_session_update", op)
+
+
+def scenario_session_store_mongo(mongo_db) -> List[ScenarioResult]:
+    """
+    MongoDB에서 동일한 세션 문서 workload를 측정합니다.
+
+    - read: find_one()
+    - update: update_one($set)
+    """
+    collection = mongo_db["sessions"]
+    collection.drop()
+    docs = [
+        {"session_id": f"session:{i:04d}", **_build_session_payload(i)}
+        for i in range(CONFIG.session_count)
+    ]
+    collection.insert_many(docs)
+    session_ids = [doc["session_id"] for doc in docs]
+    collection.create_index("session_id", unique=True)
+
+    def read_op():
+        session_id = random.choice(session_ids)
+        collection.find_one({"session_id": session_id}, {"_id": 0})
+
+    def update_op():
+        session_id = random.choice(session_ids)
+        collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"last_seen": str(int(time.time()))}},
+        )
+
+    return [
+        run_scenario("mongodb", "2_session_read", read_op),
+        run_scenario("mongodb", "2_session_update", update_op),
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -642,6 +767,77 @@ def scenario_pubsub(r_official: redis.Redis) -> ScenarioResult:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 시나리오 9: In-Process Hash Collision Stress
+# ─────────────────────────────────────────────────────────────────
+
+def scenario_hash_collision_lookup(
+    table_cls: type[BaseHashTable],
+    colliding: bool,
+) -> ScenarioResult:
+    """
+    네트워크/RESP를 제외하고 hash table 구현 자체의 lookup 비용을 측정한다.
+
+    colliding=True면 같은 home bucket으로 몰리는 키를 사용한다.
+    """
+    entry_count = _hash_micro_entry_count()
+    capacity = _hash_micro_capacity()
+    keys = (
+        _generate_colliding_keys(entry_count, capacity)
+        if colliding
+        else _generate_uniform_keys(entry_count)
+    )
+    table = _make_populated_hash_table(table_cls, keys, capacity)
+
+    def op():
+        key = random.choice(keys)
+        table.get(key)
+
+    impl = _hash_impl_name(table_cls)
+    suffix = "collision" if colliding else "uniform"
+    return run_scenario("mini-redis-inproc", f"9_hash_lookup_{impl}_{suffix}", op)
+
+
+def scenario_hash_collision_insert(
+    table_cls: type[BaseHashTable],
+    colliding: bool,
+) -> ScenarioResult:
+    """
+    매 반복마다 새 table을 만들고 동일한 키셋을 insert해 write-path 비용을 측정한다.
+    """
+    entry_count = _hash_micro_entry_count()
+    capacity = _hash_micro_capacity()
+    keys = (
+        _generate_colliding_keys(entry_count, capacity)
+        if colliding
+        else _generate_uniform_keys(entry_count)
+    )
+
+    def op():
+        table = table_cls(capacity=capacity)
+        for index, key in enumerate(keys):
+            table.set(key, f"value:{index}")
+
+    impl = _hash_impl_name(table_cls)
+    suffix = "collision" if colliding else "uniform"
+    return run_scenario(
+        "mini-redis-inproc",
+        f"9_hash_insert_{impl}_{suffix}",
+        op,
+        operations_per_iteration=entry_count,
+    )
+
+
+def run_hash_table_comparison() -> List[ScenarioResult]:
+    results: List[ScenarioResult] = []
+    for table_cls in (OpenAddressHashTable, ChainedHashTable):
+        results.append(scenario_hash_collision_lookup(table_cls, colliding=False))
+        results.append(scenario_hash_collision_lookup(table_cls, colliding=True))
+        results.append(scenario_hash_collision_insert(table_cls, colliding=False))
+        results.append(scenario_hash_collision_insert(table_cls, colliding=True))
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────
 # 결과 출력 및 저장
 # ─────────────────────────────────────────────────────────────────
 
@@ -777,13 +973,19 @@ def main():
         print(f"    {svc} 완료")
 
     # ── 시나리오 2: Session Store ────────────────────────────────
-    print("▶ 시나리오 2: Session Store (HSET/HGETALL)")
+    print("▶ 시나리오 2: Session Store (hash/document read+update)")
     for svc, r in targets:
         try:
-            all_results.append(scenario_session_store(r, svc))
+            all_results.append(scenario_session_store_read(r, svc))
+            all_results.append(scenario_session_store_update(r, svc))
             print(f"    {svc} 완료")
         except Exception as e:
             print(f"    {svc} 스킵 (미구현): {e}")
+    try:
+        all_results.extend(scenario_session_store_mongo(mongo_db))
+        print("    mongodb 완료")
+    except Exception as e:
+        print(f"    mongodb 스킵: {e}")
 
     # ── 시나리오 3: Rate Limiting ────────────────────────────────
     print("▶ 시나리오 3: Rate Limiting (INCR+EXPIRE)")
@@ -839,6 +1041,11 @@ def main():
         print("    redis-official 완료")
     except Exception as e:
         print(f"    스킵: {e}")
+
+    # ── 시나리오 9: Hash collision stress ────────────────────────
+    print("▶ 시나리오 9: In-Process Hash Collision Stress")
+    all_results.extend(run_hash_table_comparison())
+    print("    mini-redis-inproc 완료")
 
     # ── 결과 출력 및 저장 ────────────────────────────────────────
     print_results(all_results)
