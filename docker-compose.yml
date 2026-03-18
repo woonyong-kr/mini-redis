@@ -29,6 +29,7 @@ services:
     ports:
       - "${MINI_REDIS_HOST_PORT:-6380}:${MINI_REDIS_SERVER_PORT:-6379}"
     environment:
+      PYTHONUNBUFFERED: "1"
       MINI_REDIS_HOST: ${MINI_REDIS_HOST:-0.0.0.0}
       MINI_REDIS_PORT: ${MINI_REDIS_SERVER_PORT:-6379}
       MINI_REDIS_READ_CHUNK: ${MINI_REDIS_READ_CHUNK:-4096}
@@ -60,6 +61,7 @@ services:
       - mini-redis
       - mongodb
     environment:
+      PYTHONUNBUFFERED: "1"
       REDIS_OFFICIAL_HOST: ${BENCH_REDIS_OFFICIAL_HOST:-redis-official}
       REDIS_OFFICIAL_PORT: ${BENCH_REDIS_OFFICIAL_PORT:-6379}
       MINI_REDIS_HOST: ${BENCH_MINI_REDIS_HOST:-mini-redis}
@@ -87,7 +89,7 @@ services:
       - bench-net
     # 서비스들이 준비될 때까지 잠깐 대기 후 실행
     command: >
-      sh -c "sleep ${BENCH_STARTUP_DELAY_SECONDS:-3} && python benchmark.py"
+      sh -c "sleep ${BENCH_STARTUP_DELAY_SECONDS:-3} && python -u benchmark.py"
 
 networks:
   bench-net:
