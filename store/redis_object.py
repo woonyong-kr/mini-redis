@@ -72,17 +72,26 @@ class RedisObject:
 # ─────────────────────────────────────────
 
 def make_string(value: str) -> RedisObject:
+
     """
     String 타입 RedisObject 생성.
     값이 정수로 변환 가능하면 ENC_INT, 아니면 ENC_RAW 인코딩 사용.
-
-    예: make_string("hello") → encoding="raw",  value="hello"
-        make_string("42")    → encoding="int",  value="42"
     """
-    # 정수로 변환 가능한 문자열이면 int 인코딩으로 최적화
-    encoding = ENC_INT if _is_integer_string(value) else ENC_RAW
-    return RedisObject(TYPE_STRING, encoding, value)
 
+    # 1. 입력 검증
+    if value is None:
+        raise ValueError("value cannot be None")
+
+    # 2. 인코딩 결정 (핵심 로직)
+    if _is_integer_string(value):
+        encoding = ENC_INT
+    else:
+        encoding = ENC_RAW
+
+    # 3. RedisObject 생성
+    obj = RedisObject(TYPE_STRING, encoding, value)
+
+    return obj
 
 def make_hash(value: dict = None) -> RedisObject:
     """
