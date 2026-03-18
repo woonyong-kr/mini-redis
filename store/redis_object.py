@@ -1,20 +1,13 @@
-"""
-RedisObject - Redis의 핵심 추상화 자료형
+"""Shared object wrappers used by the in-memory store.
 
-실제 Redis C 코드의 robj(redisObject) 구조체를 Python으로 구현합니다.
-
-Redis의 모든 값은 타입에 상관없이 RedisObject 하나로 표현됩니다.
-  - type    : 논리적 타입 (string, hash, list, set, zset)
-  - encoding: 물리적 인코딩 방식 (실제 데이터가 어떤 구조로 저장되는지)
-  - value   : 실제 데이터
-  - refcount: 참조 카운트 (현재는 구조 반영용, 항상 1)
-
-예시:
-  SET foo bar  →  RedisObject(type="string", encoding="raw",       value="bar")
-  HSET h f v   →  RedisObject(type="hash",   encoding="hashtable", value=<Hash>)
+Every key stores one `RedisObject` that records the logical Redis type, the
+chosen internal encoding, and the concrete Python value that backs it.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, Union
+from store.skiplist import ZSet
 
 
 # ─────────────────────────────────────────
@@ -32,32 +25,25 @@ TYPE_NONE   = "none"   # 키가 존재하지 않을 때
 # ─────────────────────────────────────────
 ENC_RAW       = "raw"       # 일반 문자열
 ENC_INT       = "int"       # 정수로 변환 가능한 문자열 (최적화용)
-ENC_DICT      = "dict"      # Python dict (호환용 / ZSet 임시 구현)
+ENC_DICT      = "dict"      # Python dict
 ENC_DEQUE     = "deque"     # collections.deque (List)
 ENC_HASHTABLE = "hashtable" # Python set (Set)
-ENC_SKIPLIST  = "skiplist"  # ZSet 전용 (현재는 dict로 구현, 추후 교체)
+ENC_SKIPLIST  = "skiplist"  # ZSet 전용
+
+RESP_ENCODING = "utf-8"
+RESP_ERRORS = "surrogateescape"
 
 
 class RedisObject:
-    """
-    Redis의 모든 값을 표현하는 범용 래퍼 클래스.
-
-    실제 Redis의 redisObject 구조체:
-      typedef struct redisObject {
-          unsigned type:4;
-          unsigned encoding:4;
-          void *ptr;          ← 여기서는 value
-          int refcount;
-      } robj;
-    """
+    """Wraps one stored value with its logical type and encoding."""
 
     __slots__ = ("type", "encoding", "value", "refcount")
 
     def __init__(self, type: str, encoding: str, value: Any):
-        self.type     = type      # TYPE_STRING, TYPE_HASH, ...
-        self.encoding = encoding  # ENC_RAW, ENC_INT, ENC_DICT, ...
-        self.value    = value     # 실제 데이터
-        self.refcount = 1         # 참조 카운트 (현재는 항상 1)
+        self.type = type
+        self.encoding = encoding
+        self.value = value
+        self.refcount = 1
 
     def __repr__(self) -> str:
         return (
@@ -67,39 +53,27 @@ class RedisObject:
         )
 
 
-# ─────────────────────────────────────────
-# 팩토리 함수 - 타입별 RedisObject 생성
-# ─────────────────────────────────────────
+def to_bytes(value: Union[str, bytes]) -> bytes:
+    """Uses the same codec policy as the RESP parser/encoder path."""
+    if isinstance(value, bytes):
+        return value
+    return value.encode(RESP_ENCODING, errors=RESP_ERRORS)
 
-def make_string(value: str) -> RedisObject:
 
-    """
-    String 타입 RedisObject 생성.
-    값이 정수로 변환 가능하면 ENC_INT, 아니면 ENC_RAW 인코딩 사용.
-    """
-
-    # 1. 입력 검증
+def make_string(value: Union[str, bytes]) -> RedisObject:
+    """Builds a string object and records whether it can be treated as an int."""
     if value is None:
         raise ValueError("value cannot be None")
 
-    # 2. 인코딩 결정 (핵심 로직)
-    if _is_integer_string(value):
+    raw_value = to_bytes(value)
+    if _is_integer_string(raw_value):
         encoding = ENC_INT
     else:
         encoding = ENC_RAW
-
-    # 3. RedisObject 생성
-    obj = RedisObject(TYPE_STRING, encoding, value)
-
-    return obj
+    return RedisObject(TYPE_STRING, encoding, raw_value)
 
 def make_hash(value: Any = None) -> RedisObject:
-    """
-    Hash 타입 RedisObject 생성.
-    value는 커스텀 Hash 또는 dict 호환 입력을 받을 수 있습니다.
-
-    예: make_hash(custom_hash)
-    """
+    """Builds a hash object from either a custom hash table or a plain mapping."""
     if value is None:
         return RedisObject(TYPE_HASH, ENC_DICT, {})
     if isinstance(value, dict):
@@ -108,37 +82,31 @@ def make_hash(value: Any = None) -> RedisObject:
 
 
 def make_list(value=None) -> RedisObject:
-    """
-    List 타입 RedisObject 생성.
-    value는 collections.deque를 사용합니다.
-    """
+    """Builds a list object backed by `collections.deque`."""
     from collections import deque
     return RedisObject(TYPE_LIST, ENC_DEQUE, value if value is not None else deque())
 
 
 def make_set(value: set = None) -> RedisObject:
-    """
-    Set 타입 RedisObject 생성.
-    value는 Python set을 사용합니다.
-    """
+    """Builds a set object backed by Python's hash set."""
     return RedisObject(TYPE_SET, ENC_HASHTABLE, value if value is not None else set())
 
 
-def make_zset(value: dict = None) -> RedisObject:
-    """
-    Sorted Set 타입 RedisObject 생성.
-    value는 {"member": score} 형태의 Python dict를 사용합니다.
-    (추후 직접 구현한 스킵리스트로 교체 예정)
-    """
-    return RedisObject(TYPE_ZSET, ENC_SKIPLIST, value if value is not None else {})
+def make_zset(value: Any = None) -> RedisObject:
+    """Builds a sorted set object backed by the local `ZSet` wrapper."""
+    if value is None:
+        zset = ZSet()
+    elif isinstance(value, ZSet):
+        zset = value
+    elif isinstance(value, dict):
+        zset = ZSet.from_items(value.items())
+    else:
+        zset = ZSet.from_items(value)
+    return RedisObject(TYPE_ZSET, ENC_SKIPLIST, zset)
 
 
-# ─────────────────────────────────────────
-# 내부 헬퍼
-# ─────────────────────────────────────────
-
-def _is_integer_string(s: str) -> bool:
-    """문자열이 정수로 변환 가능한지 확인합니다."""
+def _is_integer_string(s: Union[str, bytes]) -> bool:
+    """Returns True when a bytes/string payload can be parsed as an integer."""
     try:
         int(s)
         return True

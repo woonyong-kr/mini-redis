@@ -1,10 +1,5 @@
-import asyncio
-
-import pytest
-
 from protocol.encoder import encode_bulk_string
 from protocol.parser import parse
-from server import Server
 from store.datastore import DataStore
 from store.redis_object import make_string
 
@@ -41,30 +36,3 @@ def test_datastore_delete_hooks_run_on_delete_and_flush():
     store.flush()
 
     assert deleted == ["alpha", "beta"]
-
-
-@pytest.mark.asyncio
-async def test_subscribe_mode_returns_to_general_mode_after_unsubscribe():
-    redis_server = Server()
-    tcp_server = await asyncio.start_server(redis_server.handle_client, "127.0.0.1", 0)
-    host, port = tcp_server.sockets[0].getsockname()[:2]
-
-    reader, writer = await asyncio.open_connection(host, port)
-
-    subscribe_reply = b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
-    unsubscribe_reply = b"*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:0\r\n"
-
-    writer.write(encode_command("SUBSCRIBE", "news"))
-    await writer.drain()
-    assert await asyncio.wait_for(reader.readexactly(len(subscribe_reply)), timeout=1) == subscribe_reply
-
-    writer.write(encode_command("UNSUBSCRIBE", "news") + encode_command("PING"))
-    await writer.drain()
-    assert await asyncio.wait_for(reader.readexactly(len(unsubscribe_reply)), timeout=1) == unsubscribe_reply
-    assert await asyncio.wait_for(reader.readexactly(len(b"+PONG\r\n")), timeout=1) == b"+PONG\r\n"
-
-    writer.close()
-    await writer.wait_closed()
-
-    tcp_server.close()
-    await tcp_server.wait_closed()

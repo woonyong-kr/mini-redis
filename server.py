@@ -1,34 +1,35 @@
-"""
-mini-redis 서버 진입점
+"""TCP entrypoint for the mini-redis core profile.
 
-asyncio 기반 TCP 서버로, Redis 클라이언트(redis-cli, redis-py 등)와
-RESP 프로토콜로 통신합니다.
+Each connection follows the same pipeline:
+read RESP bytes into a bounded buffer, dispatch complete commands against the
+shared store, persist successful writes, then encode and flush replies.
 
-실행 방법:
-  python server.py
-  python server.py --host 0.0.0.0 --port 6380
-
-테스트 방법:
-  redis-cli -p 6379 ping
-  redis-cli -p 6379 set foo bar
-  redis-cli -p 6379 get foo
+The server also applies simple client guards so one connection cannot hold the
+event loop for too long or keep unlimited request/response buffers in memory.
 """
 
-import asyncio
+from __future__ import annotations
+
 import argparse
+import asyncio
 import logging
 import os
+
 import uvloop
+
+from commands.dispatcher import dispatch
+from protocol.encoder import RespError, encode
+from protocol.parser import parse
+from store.datastore import DataStore
+from store.expiry import ExpiryManager
+from store.persistence import PersistenceManager
+
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-from store.datastore import DataStore
-from store.expiry import ExpiryManager
-from store.pubsub import PubSubManager
-from protocol.parser import parse
-from protocol.encoder import encode, RespError
-from commands.dispatcher import dispatch
-from commands.pubsub_cmds import cmd_subscribe, cmd_unsubscribe
+
+class ClientLimitError(Exception):
+    """Raised when a client exceeds the configured buffer or drain limits."""
 
 
 def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
@@ -53,187 +54,229 @@ def _env_float(name: str, default: float, *, min_value: float = 0.0) -> float:
     return value
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_memory(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+
+    value = raw.strip().lower()
+    suffixes = {
+        "kb": 1024,
+        "k": 1024,
+        "mb": 1024 * 1024,
+        "m": 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+    }
+    for suffix, multiplier in suffixes.items():
+        if value.endswith(suffix):
+            return int(float(value[:-len(suffix)]) * multiplier)
+    return int(value)
+
+
 DEFAULT_HOST = os.getenv("MINI_REDIS_HOST", "127.0.0.1")
 DEFAULT_PORT = _env_int("MINI_REDIS_PORT", 6379)
 DEFAULT_READ_CHUNK = _env_int("MINI_REDIS_READ_CHUNK", 4096)
 DEFAULT_EXPIRY_LOOP_INTERVAL = (
     _env_float("MINI_REDIS_EXPIRY_LOOP_INTERVAL_MS", 100.0, min_value=1.0) / 1000.0
 )
+DEFAULT_EXPIRY_SAMPLE_SIZE = _env_int("MINI_REDIS_EXPIRY_SAMPLE_SIZE", 20)
+DEFAULT_EXPIRY_MAX_PASSES = _env_int("MINI_REDIS_EXPIRY_MAX_PASSES", 4)
 DEFAULT_LOG_LEVEL = os.getenv("MINI_REDIS_LOG_LEVEL", "INFO").upper()
+DEFAULT_MAXMEMORY = _env_memory("MINI_REDIS_MAXMEMORY", 0)
+DEFAULT_MAXMEMORY_POLICY = os.getenv("MINI_REDIS_MAXMEMORY_POLICY", "noeviction")
+DEFAULT_AOF_ENABLED = _env_bool("MINI_REDIS_APPENDONLY", False)
+DEFAULT_AOF_FILE = os.getenv("MINI_REDIS_AOF_FILE", "data/appendonly.aof")
+DEFAULT_AOF_FSYNC = os.getenv("MINI_REDIS_AOF_FSYNC", "everysec")
+DEFAULT_RDB_ENABLED = _env_bool("MINI_REDIS_RDB_ENABLED", False)
+DEFAULT_RDB_FILE = os.getenv("MINI_REDIS_RDB_FILE", "data/dump.rdb")
+DEFAULT_RDB_SAVE_INTERVAL = _env_float("MINI_REDIS_RDB_SAVE_INTERVAL_SECONDS", 0.0, min_value=0.0)
+DEFAULT_CLIENT_IDLE_TIMEOUT = _env_float("MINI_REDIS_CLIENT_IDLE_TIMEOUT_SECONDS", 30.0, min_value=0.1)
+DEFAULT_WRITE_DRAIN_TIMEOUT = _env_float("MINI_REDIS_WRITE_DRAIN_TIMEOUT_SECONDS", 5.0, min_value=0.1)
+DEFAULT_MAX_INPUT_BUFFER = _env_int("MINI_REDIS_MAX_INPUT_BUFFER_BYTES", 1024 * 1024, min_value=1024)
+DEFAULT_MAX_OUTPUT_BUFFER = _env_int("MINI_REDIS_MAX_OUTPUT_BUFFER_BYTES", 256 * 1024, min_value=1024)
+DEFAULT_MAX_COMMANDS_PER_TICK = _env_int("MINI_REDIS_MAX_COMMANDS_PER_TICK", 128, min_value=1)
 
 logging.basicConfig(
     level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 class Server:
+    """Owns shared store state and serves RESP connections over TCP."""
 
     def __init__(
         self,
         *,
         read_chunk: int = DEFAULT_READ_CHUNK,
         expiry_interval_seconds: float = DEFAULT_EXPIRY_LOOP_INTERVAL,
+        expiry_sample_size: int = DEFAULT_EXPIRY_SAMPLE_SIZE,
+        expiry_max_passes: int = DEFAULT_EXPIRY_MAX_PASSES,
+        maxmemory_bytes: int = DEFAULT_MAXMEMORY,
+        eviction_policy: str = DEFAULT_MAXMEMORY_POLICY,
+        aof_enabled: bool = DEFAULT_AOF_ENABLED,
+        aof_path: str = DEFAULT_AOF_FILE,
+        aof_fsync: str = DEFAULT_AOF_FSYNC,
+        rdb_enabled: bool = DEFAULT_RDB_ENABLED,
+        rdb_path: str = DEFAULT_RDB_FILE,
+        rdb_save_interval_seconds: float = DEFAULT_RDB_SAVE_INTERVAL,
+        client_idle_timeout_seconds: float = DEFAULT_CLIENT_IDLE_TIMEOUT,
+        write_drain_timeout_seconds: float = DEFAULT_WRITE_DRAIN_TIMEOUT,
+        max_input_buffer_bytes: int = DEFAULT_MAX_INPUT_BUFFER,
+        max_output_buffer_bytes: int = DEFAULT_MAX_OUTPUT_BUFFER,
+        max_commands_per_tick: int = DEFAULT_MAX_COMMANDS_PER_TICK,
     ):
-        # 서버 전체에서 공유하는 인메모리 스토어와 TTL 관리자
-        self.store = DataStore()
-        self.expiry = ExpiryManager(self.store, interval_seconds=expiry_interval_seconds)
-        # Pub/Sub 채널 관리자 (DataStore와 독립적으로 존재)
-        self.pubsub = PubSubManager()
+        self.store = DataStore(
+            maxmemory_bytes=maxmemory_bytes,
+            eviction_policy=eviction_policy,
+        )
+        self.expiry = ExpiryManager(
+            self.store,
+            interval_seconds=expiry_interval_seconds,
+            sample_size=expiry_sample_size,
+            max_passes=expiry_max_passes,
+        )
+        self.persistence = PersistenceManager(
+            self.store,
+            self.expiry,
+            aof_enabled=aof_enabled,
+            aof_path=aof_path,
+            aof_fsync=aof_fsync,
+            rdb_enabled=rdb_enabled,
+            rdb_path=rdb_path,
+            rdb_save_interval_seconds=rdb_save_interval_seconds,
+        )
         self.read_chunk = read_chunk
+        self.client_idle_timeout_seconds = client_idle_timeout_seconds
+        self.write_drain_timeout_seconds = write_drain_timeout_seconds
+        self.max_input_buffer_bytes = max_input_buffer_bytes
+        self.max_output_buffer_bytes = max_output_buffer_bytes
+        self.max_commands_per_tick = max_commands_per_tick
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """
-        클라이언트 연결 핸들러.
-        클라이언트가 접속할 때마다 이 코루틴이 하나씩 실행됩니다.
-
-        두 가지 모드:
-          1. 일반 모드: 요청 → 응답 (기존 방식)
-          2. 구독 모드: SUBSCRIBE 이후 진입, 서버가 먼저 push 가능
-        """
-        addr = writer.get_extra_info("peername")
-        buffer = b""
-
+    async def _read_chunk(self, reader: asyncio.StreamReader) -> bytes:
         try:
-            while True:
-                # 클라이언트로부터 설정된 청크 크기만큼 읽음
-                chunk = await reader.read(self.read_chunk)
-                if not chunk:
-                    break  # 빈 데이터 = 클라이언트가 연결을 끊은 것
+            return await asyncio.wait_for(
+                reader.read(self.read_chunk),
+                timeout=self.client_idle_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ClientLimitError("idle timeout") from exc
 
-                buffer += chunk
+    async def _drain(self, writer: asyncio.StreamWriter) -> None:
+        try:
+            await asyncio.wait_for(
+                writer.drain(),
+                timeout=self.write_drain_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ClientLimitError("write drain timeout") from exc
 
-                # 버퍼에서 완전한 명령어를 하나씩 꺼내 처리 (파이프라인 지원)
-                while buffer:
-                    command, consumed = parse(buffer)
-                    if command is None:
-                        break  # 데이터가 불완전 → 다음 read()에서 더 받을 때까지 대기
+    def _configure_writer_limits(self, writer: asyncio.StreamWriter) -> None:
+        transport = getattr(writer, "transport", None)
+        if transport is None or not hasattr(transport, "set_write_buffer_limits"):
+            return
+        low = max(1, self.max_output_buffer_bytes // 2)
+        transport.set_write_buffer_limits(high=self.max_output_buffer_bytes, low=low)
 
-                    buffer = buffer[consumed:]  # 파싱한 만큼 버퍼에서 제거
+    def _write_buffer_size(self, writer: asyncio.StreamWriter) -> int:
+        transport = getattr(writer, "transport", None)
+        if transport is None or not hasattr(transport, "get_write_buffer_size"):
+            return 0
+        return transport.get_write_buffer_size()
 
-                    cmd_name = command[0].upper() if command else ""
+    async def _flush_output_if_needed(self, writer: asyncio.StreamWriter) -> None:
+        if self._write_buffer_size(writer) <= self.max_output_buffer_bytes:
+            return
+        await self._drain(writer)
+        if self._write_buffer_size(writer) > self.max_output_buffer_bytes:
+            raise ClientLimitError("output buffer limit exceeded")
 
-                    # ── Pub/Sub 전용 명령어 처리 ──────────────────────────────
-                    if cmd_name == "SUBSCRIBE":
-                        channels = command[1:]
-                        if not channels:
-                            writer.write(encode(RespError("ERR wrong number of arguments for 'subscribe' command")))
-                            await writer.drain()
-                            continue
-                        await cmd_subscribe(self.pubsub, writer, channels)
-                        # 구독 모드 전환: 이 연결은 이제 push 수신 전용
-                        should_close, buffer = await self._subscribe_loop(reader, writer, buffer)
-                        if should_close:
-                            return
-                        continue
+    async def _send_protocol_error(self, writer: asyncio.StreamWriter, message: str) -> None:
+        writer.write(encode(RespError(message)))
+        try:
+            await self._drain(writer)
+        except ClientLimitError:
+            pass
 
-                    elif cmd_name == "PUBLISH":
-                        # PUBLISH는 구독 모드가 아닌 일반 클라이언트가 사용
-                        if len(command) != 3:
-                            writer.write(encode(RespError("ERR wrong number of arguments for 'publish' command")))
-                        else:
-                            from commands.pubsub_cmds import cmd_publish
-                            count = await cmd_publish(self.pubsub, command[1], command[2])
-                            writer.write(encode(count))
-
-                    # ── 일반 명령어 처리 ─────────────────────────────────────
-                    else:
-                        result = dispatch(command, self.store, self.expiry)
-                        writer.write(encode(result))
-
-                await writer.drain()  # 응답을 실제로 전송
-
-        except ConnectionResetError:
-            pass  # 클라이언트가 갑자기 끊어도 서버는 계속 동작
-        except Exception as e:
-            logger.error(f"Error handling client {addr}: {e}")
-            try:
-                writer.write(encode(RespError(f"ERR server error: {str(e)}")))
-                await writer.drain()
-            except Exception:
-                pass
-        finally:
-            self.pubsub.unsubscribe_all(writer)  # 연결 종료 시 구독 정리
-            writer.close()  # 어떤 경우든 연결은 반드시 닫음
-
-    async def _subscribe_loop(
+    async def handle_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        buffer: bytes = b"",
-    ) -> tuple[bool, bytes]:
-        """
-        구독 모드 전용 루프.
+    ) -> None:
+        addr = writer.get_extra_info("peername")
+        buffer = b""
+        commands_in_tick = 0
+        self._configure_writer_limits(writer)
 
-        SUBSCRIBE 이후 이 연결은 구독 모드가 됩니다.
-        구독 모드에서는 SUBSCRIBE, UNSUBSCRIBE, PING, QUIT만 허용됩니다.
-        (실제 Redis 동일한 동작)
-
-        발행된 메시지는 PubSubManager.publish()에서 writer에 직접 씁니다.
-        이 루프는 클라이언트가 UNSUBSCRIBE로 모두 해제하거나
-        연결을 끊을 때까지 실행됩니다.
-        """
-        while True:
-            while buffer:
-                command, consumed = parse(buffer)
-                if command is None:
-                    break
-                buffer = buffer[consumed:]
-
-                cmd_name = command[0].upper() if command else ""
-
-                if cmd_name == "SUBSCRIBE":
-                    # 구독 모드 안에서 추가 채널 구독
-                    await cmd_subscribe(self.pubsub, writer, command[1:])
-
-                elif cmd_name == "UNSUBSCRIBE":
-                    # 구독 해제
-                    await cmd_unsubscribe(self.pubsub, writer, command[1:])
-                    # 모든 채널 해제되면 일반 모드로 복귀 가능 (연결은 유지)
-                    if not self.pubsub.get_subscribed_channels(writer):
-                        return False, buffer
-
-                elif cmd_name == "PING":
-                    # 구독 모드의 PING은 *3 배열 형태로 응답
-                    msg = command[1] if len(command) > 1 else ""
-                    from store.pubsub import _encode_bulk
-                    pong_payload = b"*3\r\n" + _encode_bulk("pong") + _encode_bulk("") + _encode_bulk(msg)
-                    writer.write(pong_payload)
-                    await writer.drain()
-
-                elif cmd_name == "QUIT":
-                    writer.write(encode("OK"))
-                    await writer.drain()
-                    return True, b""
-
-                else:
-                    # 구독 모드에서 허용되지 않는 명령어
-                    writer.write(encode(RespError(
-                        f"ERR Command '{cmd_name}' not allowed in subscribe mode"
-                    )))
-                    await writer.drain()
-
-            try:
-                chunk = await reader.read(self.read_chunk)
+        try:
+            while True:
+                chunk = await self._read_chunk(reader)
                 if not chunk:
-                    return True, b""
-            except (ConnectionResetError, OSError):
-                return True, b""
+                    break
 
-            buffer += chunk
+                buffer += chunk
+                if len(buffer) > self.max_input_buffer_bytes:
+                    await self._send_protocol_error(writer, "ERR request buffer limit exceeded")
+                    break
 
-    async def start(self, host: str = "127.0.0.1", port: int = 6379):
-        """서버 시작"""
-        # 만료 키 청소 루프를 백그라운드에서 실행
+                while buffer:
+                    command, consumed = parse(buffer)
+                    if command is None:
+                        break
+
+                    buffer = buffer[consumed:]
+                    result = dispatch(command, self.store, self.expiry)
+                    self.persistence.record_command(command, result)
+                    writer.write(encode(result))
+                    commands_in_tick += 1
+
+                    await self._flush_output_if_needed(writer)
+
+                    if commands_in_tick >= self.max_commands_per_tick:
+                        await self._drain(writer)
+                        commands_in_tick = 0
+                        await asyncio.sleep(0)
+
+                if commands_in_tick:
+                    await self._drain(writer)
+                    commands_in_tick = 0
+
+        except (ClientLimitError, ConnectionResetError, BrokenPipeError) as exc:
+            logger.info("closing client %s: %s", addr, exc)
+        except Exception as exc:
+            logger.error("error handling client %s: %s", addr, exc)
+            try:
+                await self._send_protocol_error(writer, f"ERR server error: {exc}")
+            except Exception:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def start(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         asyncio.create_task(self.expiry.active_expiry_loop())
-
         server = await asyncio.start_server(self.handle_client, host, port)
 
-        logger.info(f"mini-redis server started on {host}:{port}")
+        logger.info("mini-redis server started on %s:%s", host, port)
 
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            self.persistence.save_rdb()
+            self.persistence.close()
 
 
 if __name__ == "__main__":

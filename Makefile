@@ -39,11 +39,12 @@ endif
 
 COMPOSE         := docker compose
 PROJECT_COMPOSE := docker-compose.yml
+DEV_COMPOSE     := docker-compose.dev.yml
 REDIS_OFFICIAL_HOST_PORT ?= 6379
 MINI_REDIS_HOST_PORT    ?= 6380
 MONGO_HOST_PORT         ?= 27017
 
-.PHONY: run bench down setup-venv install clean logs ps help
+.PHONY: run bench down dev dev-down cli cli-official setup-venv install clean logs ps help
 .DEFAULT_GOAL  := help
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +72,101 @@ run: setup-venv down _results-dir
 bench:
 	@echo "▶ 벤치마크 봇만 재실행..."
 	$(COMPOSE) -f $(PROJECT_COMPOSE) run --rm benchmark
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  run-demo — 발표용 벤치마크 (5분 이내 완료 보장)
+#
+#  .env 파일은 건드리지 않고 환경변수를 인라인으로 오버라이드
+#
+#  현재 quick_compare 설정 대비 조정 내용:
+#    BENCH_ITERATIONS      3000 → 500   (통계적으로 충분)
+#    BENCH_WARMUP           300 → 50
+#    BENCH_LEADERBOARD   5000 → 300   (ZSet 사전 삽입 병목 제거)
+#    BENCH_SESSION_COUNT    200 → 100
+#    BENCH_CACHE_HIT_KEYS  1000 → 100  (MongoDB 사전 삽입 대폭 감소)
+#    BENCH_STARTUP_DELAY      3 → 2
+#
+#  예상 소요 시간: 1-2분 (느린 Mac 에서도 5분 이내)
+# ══════════════════════════════════════════════════════════════════════════════
+run-demo: setup-venv down _results-dir
+	@echo ""
+	@echo "══════════════════════════════════════════"
+	@echo "  ▶  발표용 벤치마크 실행 (~1-2분 소요)"
+	@echo "══════════════════════════════════════════"
+	BENCH_ITERATIONS=500 \
+	BENCH_WARMUP=50 \
+	BENCH_PIPELINE_BATCH=50 \
+	BENCH_LEADERBOARD_PLAYERS=300 \
+	BENCH_SESSION_COUNT=100 \
+	BENCH_RATE_USER_COUNT=100 \
+	BENCH_QUEUE_COUNT=8 \
+	BENCH_CACHE_KEY_COUNT=200 \
+	BENCH_CACHE_HIT_KEYS=100 \
+	BENCH_STARTUP_DELAY_SECONDS=2 \
+	$(COMPOSE) -f $(PROJECT_COMPOSE) up --build --abort-on-container-exit --exit-code-from benchmark
+	@echo ""
+	@echo "✔  벤치마크 완료 — 결과 확인:"
+	@echo "   benchmark/results/report.json"
+	@echo "   benchmark/results/report.csv"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  dev — mini-redis 단독 실행 (데모 / 발표 / 수동 테스트용)
+#
+#  docker-compose.dev.yml 을 사용, 백그라운드(-d)로 기동
+#  벤치마크 봇 없음 — 직접 CLI로 명령어 입력
+#
+#  실행 : make dev
+#  접속 : make cli
+#  종료 : make dev-down
+# ══════════════════════════════════════════════════════════════════════════════
+dev:
+	@echo ""
+	@echo "══════════════════════════════════════════"
+	@echo "  ▶  mini-redis 데모 환경 시작"
+	@echo "══════════════════════════════════════════"
+	$(COMPOSE) -f $(DEV_COMPOSE) up --build -d
+	@echo ""
+	@echo "✔  mini-redis-dev 실행 중 (포트 $(MINI_REDIS_HOST_PORT))"
+	@echo "   접속 : make cli"
+	@echo "   종료 : make dev-down"
+	@echo ""
+
+# ── dev 환경 종료 ─────────────────────────────────────────────────────────────
+dev-down:
+	@echo "▶ dev 환경 종료..."
+	$(COMPOSE) -f $(DEV_COMPOSE) down --remove-orphans
+	@echo "✔ 완료"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  cli — 실행 중인 mini-redis-dev 컨테이너에 redis-cli 접속
+#
+#  docker run --network container:<name> 으로 컨테이너 네트워크에 직접 진입
+#  → 포트 포워딩 없이 내부 6379 포트로 바로 접속
+#
+#  전제 : make dev 로 mini-redis-dev 컨테이너가 먼저 실행되어 있어야 함
+# ══════════════════════════════════════════════════════════════════════════════
+cli:
+	@echo "▶ mini-redis CLI 접속 중... (컨테이너: mini-redis-dev)"
+	@docker inspect mini-redis-dev > $(DEVNULL) 2>&1 || \
+		(echo "  ✗ mini-redis-dev 가 실행되어 있지 않습니다. 먼저 'make dev' 를 실행하세요." && exit 1)
+	docker run --rm -it \
+		--network container:mini-redis-dev \
+		redis:6.2-alpine \
+		redis-cli -p 6379
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  cli-official — 벤치마크 환경의 공식 Redis 에 redis-cli 접속
+#
+#  전제 : make run (또는 docker compose up) 으로 redis-official 이 실행 중이어야 함
+# ══════════════════════════════════════════════════════════════════════════════
+cli-official:
+	@echo "▶ 공식 Redis CLI 접속 중... (컨테이너: redis-official)"
+	@docker inspect redis-official > $(DEVNULL) 2>&1 || \
+		(echo "  ✗ redis-official 이 실행되어 있지 않습니다. 먼저 'make run' 을 실행하세요." && exit 1)
+	docker run --rm -it \
+		--network container:redis-official \
+		redis:6.2-alpine \
+		redis-cli -p 6379
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  setup-venv — Python 가상환경 확인 / 생성 / 패키지 설치
@@ -153,15 +249,27 @@ ps:
 # ══════════════════════════════════════════════════════════════════════════════
 help:
 	@echo ""
-	@echo "  mini-redis Benchmark — 사용 가능한 명령어"
-	@echo "  ─────────────────────────────────────────"
-	@echo "  make run     전부 자동: venv → Docker 정리 → 서비스 기동 → 벤치마크"
-	@echo "  make bench   서비스가 떠 있을 때 벤치마크만 재실행"
-	@echo "  make down    실행 중인 컨테이너 전부 종료"
-	@echo "  make logs    전체 로그 스트리밍"
-	@echo "  make ps      컨테이너 상태 확인"
-	@echo "  make clean   venv + 결과 파일 + Docker 이미지 전부 삭제"
-	@echo "  make help    이 도움말 출력"
+	@echo "  mini-redis — 사용 가능한 명령어"
+	@echo "  ══════════════════════════════════════════════════════"
+	@echo ""
+	@echo "  ── 데모 / 발표 환경 (docker-compose.dev.yml) ──────"
+	@echo "  make dev          mini-redis 단독 컨테이너 백그라운드 실행"
+	@echo "  make cli          dev mini-redis 에 redis-cli 접속"
+	@echo "  make dev-down     dev 환경 종료"
+	@echo ""
+	@echo "  ── 벤치마크 환경 (docker-compose.yml) ─────────────"
+	@echo "  make run-demo     발표용 벤치마크 (~1-2분, 5분 이내 보장)"
+	@echo "  make run          풀 벤치마크 (quick_compare 프로필, ~5분+)"
+	@echo "  make bench        서비스가 떠 있을 때 벤치마크 봇만 재실행"
+	@echo "  make cli-official 공식 Redis 에 redis-cli 접속"
+	@echo "  make down         벤치마크 컨테이너 전부 종료"
+	@echo "  make logs         전체 로그 스트리밍"
+	@echo "  make ps           컨테이너 상태 확인"
+	@echo ""
+	@echo "  ── 공통 ────────────────────────────────────────────"
+	@echo "  make install      Python venv 생성 + 패키지 설치"
+	@echo "  make clean        venv + 결과 파일 + Docker 이미지 전부 삭제"
+	@echo "  make help         이 도움말 출력"
 	@echo ""
 	@echo "  감지된 OS : $(DETECTED_OS)"
 	@echo ""

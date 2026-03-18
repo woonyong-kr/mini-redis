@@ -28,6 +28,7 @@ class TestEncoder:
 
     def test_bulk_string(self):
         assert encode_bulk_string("foobar") == b"$6\r\nfoobar\r\n"
+        assert encode_bulk_string(b"foobar") == b"$6\r\nfoobar\r\n"
         assert encode_bulk_string("") == b"$0\r\n\r\n"
         assert encode_bulk_string(None) == b"$-1\r\n"
 

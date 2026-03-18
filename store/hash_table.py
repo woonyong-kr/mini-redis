@@ -1,9 +1,7 @@
-"""
-커스텀 Redis-like hash 구조 구현.
+"""Custom hash structures used by the hash object path.
 
-- seed 정책: MurmurHash3 seed는 항상 0을 사용한다.
-- compact 표현: 작은 hash는 (field, value) 튜플 리스트로 저장한다.
-- hashtable 표현: Open Addressing + Double Hashing + tombstone을 사용한다.
+Small hashes stay compact for a while and then promote into an open-addressed
+table. The file is store-facing and does not expose Redis commands directly.
 """
 
 from __future__ import annotations
@@ -83,27 +81,27 @@ class BaseHashTable(ABC):
 
     @abstractmethod
     def set(self, key: str, value: str) -> bool:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def get(self, key: str) -> str | None:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def delete(self, key: str) -> bool:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def contains(self, key: str) -> bool:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def items(self) -> List[Tuple[str, str]]:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def __len__(self) -> int:
-        raise NotImplementedError
+        ...
 
 
 @dataclass

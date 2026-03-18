@@ -1,5 +1,7 @@
-"""
-List 명령어 핸들러 (팀원 D 담당)
+"""List command handlers.
+
+The list path stays focused on queue-style operations: push, pop, ranged read,
+and a couple of indexed helpers used by tests and admin tooling.
 """
 
 from typing import List, Any
@@ -8,6 +10,10 @@ from store.expiry import ExpiryManager
 from protocol.encoder import SimpleString, RespError
 
 WRONGTYPE_ERROR = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+
+def _wrong_number(command: str) -> RespError:
+    return RespError(f"ERR wrong number of arguments for '{command}' command")
 
 
 def cmd_lpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -126,7 +132,20 @@ def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     특정 인덱스의 원소를 반환합니다.
     반환: 값 (bulk string) 또는 nil (범위 초과)
     """
-    raise NotImplementedError
+    if len(args) != 2:
+        return _wrong_number("lindex")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    try:
+        index = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.lindex(key, index)
 
 
 def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -135,4 +154,23 @@ def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     특정 인덱스의 원소를 변경합니다.
     반환: +OK 또는 오류 (인덱스 범위 초과)
     """
-    raise NotImplementedError
+    if len(args) != 3:
+        return _wrong_number("lset")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    try:
+        index = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    try:
+        store.lset(key, index, args[2])
+    except KeyError:
+        return RespError("ERR no such key")
+    except IndexError:
+        return RespError("ERR index out of range")
+    return SimpleString("OK")

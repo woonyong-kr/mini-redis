@@ -1,207 +1,206 @@
-"""
-String 명령어 핸들러 (팀원 C 담당)
+"""String command handlers for the mini-redis core profile.
 
-모든 함수는 동일한 시그니처를 가집니다:
-  (store, expiry, args) → Any
-
-반환값은 Python 값으로, server.py의 encode()가 RESP 바이트로 변환합니다.
-  성공 메시지  → SimpleString("OK")
-  오류        → RespError("ERR ...")
-  문자열      → str 또는 None
-  숫자        → int
-  목록        → list
-
-args: 명령어 뒤의 인자 리스트 (명령어 이름 제외)
-예: "SET foo bar" → args = ["foo", "bar"]
+The file keeps one narrow flow for every command:
+validate arguments, verify type, mutate the store, then adjust TTL state.
+`MSET` is the only multi-key write here, so it also carries rollback logic.
 """
 
-from typing import List, Any
+from __future__ import annotations
+
+from typing import Any, List
+
+from protocol.encoder import RespError, SimpleString
 from store.datastore import DataStore
 from store.expiry import ExpiryManager
-from store.redis_object import TYPE_STRING, make_string
-from protocol.encoder import SimpleString, RespError
+from store.redis_object import TYPE_STRING, make_string, to_bytes
 
 
-def cmd_get(store, expiry, args):
-    if len(args) != 1:
-        return RespError("ERR wrong number of arguments")
+WRONGTYPE_ERROR = "WRONGTYPE Operation against a key holding the wrong kind of value"
+INTEGER_ERROR = "ERR value is not an integer or out of range"
 
-    key = args[0]
 
-    if expiry.is_expired(key):
-        store.delete(key)
-        return None
+def _wrong_number(command: str) -> RespError:
+    return RespError(f"ERR wrong number of arguments for '{command}' command")
 
+
+def _string_object(store: DataStore, key: str):
     obj = store.get(key)
-
     if obj is None:
         return None
+    if obj.type != TYPE_STRING:
+        return RespError(WRONGTYPE_ERROR)
+    return obj
 
+
+def _require_integer(value: bytes) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def cmd_get(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
+    if len(args) != 1:
+        return _wrong_number("get")
+
+    obj = _string_object(store, args[0])
+    if obj is None:
+        return None
+    if isinstance(obj, RespError):
+        return obj
     return obj.value
 
 
-def cmd_set(store, expiry, args):
+def cmd_set(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) < 2:
-        return RespError("ERR wrong number of arguments")
+        return _wrong_number("set")
 
     key = args[0]
     value = args[1]
+    expiry_seconds = None
+    index = 2
 
-    # 저장
-    obj = make_string(value)
-    store.set(key, obj)
+    while index < len(args):
+        option = args[index].upper()
 
-    # 기존 TTL 제거
+        if option == "EX" and index + 1 < len(args):
+            try:
+                seconds = int(args[index + 1])
+            except ValueError:
+                return RespError(INTEGER_ERROR)
+            if seconds <= 0:
+                return RespError("ERR invalid expire time in 'set' command")
+            expiry_seconds = float(seconds)
+            index += 2
+            continue
+
+        if option == "PX" and index + 1 < len(args):
+            try:
+                milliseconds = int(args[index + 1])
+            except ValueError:
+                return RespError(INTEGER_ERROR)
+            if milliseconds <= 0:
+                return RespError("ERR invalid expire time in 'set' command")
+            expiry_seconds = milliseconds / 1000.0
+            index += 2
+            continue
+
+        return RespError("ERR syntax error")
+
+    store.set(key, make_string(value))
     expiry.remove_expiry(key)
-
-    # EX 옵션만 최소 처리 (지금 단계)
-    if len(args) >= 4 and args[2].upper() == "EX":
-        seconds = int(args[3])
-        expiry.set_expiry(key, float(seconds))
-
-    return "OK"
+    if expiry_seconds is not None:
+        expiry.set_expiry(key, expiry_seconds)
+    return SimpleString("OK")
 
 
 def cmd_mget(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
-    result = []
+    if not args:
+        return _wrong_number("mget")
 
+    values = []
     for key in args:
-        if expiry.is_expired(key):
-            store.delete(key)
-            result.append(None)
-            continue
-
-        obj = store.get(key)
-        if obj is None:
-            result.append(None)
-        else:
-            result.append(obj.value)
-
-    return result
+        obj = _string_object(store, key)
+        if isinstance(obj, RespError):
+            return obj
+        values.append(None if obj is None else obj.value)
+    return values
 
 
 def cmd_mset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
-    if len(args) % 2 != 0:
-        return RespError("ERR wrong number of arguments for 'mset' command")
+    if not args or len(args) % 2 != 0:
+        return _wrong_number("mset")
 
-    for i in range(0, len(args), 2):
-        key = args[i]
-        value = args[i + 1]
+    snapshots = {}
+    expiry_snapshots = {}
+    for index in range(0, len(args), 2):
+        key = args[index]
+        if key not in snapshots:
+            snapshots[key] = store._snapshot_key(key)
+            expiry_snapshots[key] = expiry.get_expiry_at(key)
 
-        store.set(key, make_string(value))
-        expiry.remove_expiry(key)
+    try:
+        for index in range(0, len(args), 2):
+            key = args[index]
+            value = args[index + 1]
+            store.set(key, make_string(value))
+            expiry.remove_expiry(key)
+    except Exception:
+        for key, snapshot in snapshots.items():
+            store._restore_key_snapshot(key, snapshot)
+            expiry_at = expiry_snapshots[key]
+            if expiry_at is None:
+                expiry.remove_expiry(key)
+            else:
+                expiry.set_expiry_at(key, expiry_at)
+        raise
 
-    return "OK"
+    return SimpleString("OK")
 
 
 def cmd_incr(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) != 1:
-        return RespError("ERR wrong number of arguments for 'incr' command")
-
-    key = args[0]
-
-    if expiry.is_expired(key):
-        store.delete(key)
-
-    obj = store.get(key)
-
-    if obj is None:
-        value = 1
-    else:
-        try:
-            value = int(obj.value) + 1
-        except:
-            return RespError("ERR value is not an integer")
-
-    store.set(key, make_string(str(value)))
-    return value
+        return _wrong_number("incr")
+    return cmd_incrby(store, expiry, [args[0], "1"])
 
 
 def cmd_decr(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) != 1:
-        return RespError("ERR wrong number of arguments for 'decr' command")
-
-    key = args[0]
-
-    if expiry.is_expired(key):
-        store.delete(key)
-
-    obj = store.get(key)
-
-    if obj is None:
-        value = -1
-    else:
-        try:
-            value = int(obj.value) - 1
-        except:
-            return RespError("ERR value is not an integer")
-
-    store.set(key, make_string(str(value)))
-    return value
+        return _wrong_number("decr")
+    return cmd_incrby(store, expiry, [args[0], "-1"])
 
 
 def cmd_incrby(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) != 2:
-        return RespError("ERR wrong number of arguments for 'incrby' command")
+        return _wrong_number("incrby")
 
-    key = args[0]
-
+    key, increment_raw = args
     try:
-        increment = int(args[1])
-    except:
-        return RespError("ERR increment is not an integer")
+        increment = int(increment_raw)
+    except ValueError:
+        return RespError(INTEGER_ERROR)
 
-    if expiry.is_expired(key):
-        store.delete(key)
+    obj = _string_object(store, key)
+    if isinstance(obj, RespError):
+        return obj
 
-    obj = store.get(key)
+    current = 0
+    if obj is not None:
+        current = _require_integer(obj.value)
+        if current is None:
+            return RespError(INTEGER_ERROR)
 
-    if obj is None:
-        value = increment
-    else:
-        try:
-            value = int(obj.value) + increment
-        except:
-            return RespError("ERR value is not an integer")
-
-    store.set(key, make_string(str(value)))
-    return value
+    updated = current + increment
+    store.set(key, make_string(str(updated)))
+    return updated
 
 
 def cmd_append(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) != 2:
-        return RespError("ERR wrong number of arguments for 'append' command")
+        return _wrong_number("append")
 
-    key = args[0]
-    append_value = args[1]
+    key, value = args
+    obj = _string_object(store, key)
+    if isinstance(obj, RespError):
+        return obj
 
-    if expiry.is_expired(key):
-        store.delete(key)
-
-    obj = store.get(key)
-
+    append_value = to_bytes(value)
     if obj is None:
-        new_value = append_value
-    else:
-        new_value = obj.value + append_value
+        store.set(key, make_string(append_value))
+        return len(append_value)
 
-    store.set(key, make_string(new_value))
-    return len(new_value)
+    updated = obj.value + append_value
+    store.set(key, make_string(updated))
+    return len(updated)
 
 
 def cmd_strlen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if len(args) != 1:
-        return RespError("ERR wrong number of arguments for 'strlen' command")
+        return _wrong_number("strlen")
 
-    key = args[0]
-
-    if expiry.is_expired(key):
-        store.delete(key)
-        return 0
-
-    obj = store.get(key)
-
+    obj = _string_object(store, args[0])
+    if isinstance(obj, RespError):
+        return obj
     if obj is None:
         return 0
-
     return len(obj.value)

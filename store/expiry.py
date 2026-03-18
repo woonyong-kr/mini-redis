@@ -1,11 +1,11 @@
-"""
-TTL / 만료 관리 (팀원 B 담당)
+"""TTL bookkeeping and active expiry sampling.
 
-키의 만료 시간을 관리합니다.
-각 메서드를 구현하세요. 메서드 이름과 파라미터는 변경하지 마세요.
+The server uses lazy expiry on reads plus a lightweight sampled background pass
+so TTL-heavy workloads do not require full keyspace scans on every interval.
 """
 
 import asyncio
+import random
 import time
 from typing import TYPE_CHECKING
 
@@ -14,23 +14,29 @@ if TYPE_CHECKING:
 
 
 class ExpiryManager:
-    """
-    TTL 기반 키 만료 관리자.
+    """Tracks absolute expiry timestamps for keys in the datastore."""
 
-    내부 구조:
-      self._expiry: dict
-        {"key": expiry_timestamp} 형태
-    """
-
-    def __init__(self, store: "DataStore", interval_seconds: float = 0.1):
+    def __init__(
+        self,
+        store: "DataStore",
+        interval_seconds: float = 0.1,
+        sample_size: int = 20,
+        max_passes: int = 4,
+    ):
         self._store = store
         self._expiry: dict[str, float] = {}
         self._interval_seconds = interval_seconds
+        self._sample_size = sample_size
+        self._max_passes = max_passes
+        self._rng = random.Random(0)
         self._store.bind_expiry_manager(self)
         self._store.register_delete_hook(self.on_key_deleted)
 
     def set_expiry(self, key: str, seconds: float) -> None:
         self._expiry[key] = time.time() + seconds
+
+    def set_expiry_at(self, key: str, expiry_at: float) -> None:
+        self._expiry[key] = expiry_at
 
     def get_ttl(self, key: str) -> float:
         if not self._store.exists(key):
@@ -40,7 +46,7 @@ class ExpiryManager:
 
         remaining = self._expiry[key] - time.time()
         if remaining <= 0:
-            self._store.delete(key)
+            self._store.delete(key, reason="expiry")
             return -2
         return remaining
 
@@ -49,19 +55,48 @@ class ExpiryManager:
             return False
         return time.time() >= self._expiry[key]
 
+    def get_expiry_at(self, key: str):
+        return self._expiry.get(key)
+
+    def iter_expiring_keys(self):
+        return list(self._expiry.keys())
+
     def remove_expiry(self, key: str) -> None:
         self._expiry.pop(key, None)
 
     def on_key_deleted(self, key: str) -> None:
         self._expiry.pop(key, None)
 
+    def evict_expired_samples(self) -> int:
+        now = time.time()
+        removed = 0
+
+        if not self._expiry:
+            return 0
+
+        for _ in range(self._max_passes):
+            keys = list(self._expiry.keys())
+            if not keys:
+                break
+
+            if len(keys) <= self._sample_size:
+                sample = keys
+            else:
+                sample = self._rng.sample(keys, self._sample_size)
+
+            expired = [key for key in sample if now >= self._expiry.get(key, float("inf"))]
+            if not expired:
+                break
+
+            for key in expired:
+                removed += self._store.delete(key, reason="expiry")
+
+            if len(expired) * 4 < len(sample):
+                break
+
+        return removed
+
     async def active_expiry_loop(self) -> None:
         while True:
-            now = time.time()
-            expired_keys = [
-                key for key, expiry_at in list(self._expiry.items())
-                if now >= expiry_at
-            ]
-            for key in expired_keys:
-                self._store.delete(key)
+            self.evict_expired_samples()
             await asyncio.sleep(self._interval_seconds)

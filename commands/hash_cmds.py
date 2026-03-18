@@ -1,5 +1,7 @@
-"""
-Hash 명령어 핸들러 (팀원 D 담당)
+"""Hash command handlers.
+
+The public profile keeps the hash surface small: field writes, reads, deletes,
+existence checks, and whole-hash reads used by session-style workloads.
 """
 
 from __future__ import annotations
@@ -41,11 +43,16 @@ def cmd_hset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if type_error is not None:
         return type_error
 
+    snapshot = store._snapshot_key(key)
     added = 0
-    for index in range(1, len(args), 2):
-        field = args[index]
-        value = args[index + 1]
-        added += store.hset(key, field, value)
+    try:
+        for index in range(1, len(args), 2):
+            field = args[index]
+            value = args[index + 1]
+            added += store.hset(key, field, value)
+    except Exception:
+        store._restore_key_snapshot(key, snapshot)
+        raise
     return added
 
 
@@ -77,10 +84,15 @@ def cmd_hmset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     if type_error is not None:
         return type_error
 
-    for index in range(1, len(args), 2):
-        field = args[index]
-        value = args[index + 1]
-        store.hset(key, field, value)
+    snapshot = store._snapshot_key(key)
+    try:
+        for index in range(1, len(args), 2):
+            field = args[index]
+            value = args[index + 1]
+            store.hset(key, field, value)
+    except Exception:
+        store._restore_key_snapshot(key, snapshot)
+        raise
     return SimpleString("OK")
 
 

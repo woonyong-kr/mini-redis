@@ -1,0 +1,44 @@
+services:
+
+  # ── mini-redis 단독 실행 (데모 / CLI 테스트용) ─────────────────────────────
+  #
+  #  용도   : 발표 시연, redis-cli 접속, 수동 테스트
+  #  포트   : 호스트 6380 → 컨테이너 6379
+  #  벤치마크 봇 없음 (서버만 실행)
+  #
+  #  실행   : make dev
+  #  CLI    : make cli
+  #  종료   : make dev-down
+  # ───────────────────────────────────────────────────────────────────────────
+
+  mini-redis-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mini-redis-dev
+    ports:
+      - "${MINI_REDIS_HOST_PORT:-6380}:6379"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MINI_REDIS_HOST: "0.0.0.0"
+      MINI_REDIS_PORT: "6379"
+      MINI_REDIS_READ_CHUNK: ${MINI_REDIS_READ_CHUNK:-4096}
+      MINI_REDIS_EXPIRY_LOOP_INTERVAL_MS: ${MINI_REDIS_EXPIRY_LOOP_INTERVAL_MS:-100}
+      MINI_REDIS_EXPIRY_SAMPLE_SIZE: ${MINI_REDIS_EXPIRY_SAMPLE_SIZE:-20}
+      MINI_REDIS_EXPIRY_MAX_PASSES: ${MINI_REDIS_EXPIRY_MAX_PASSES:-4}
+      MINI_REDIS_MAXMEMORY: ${MINI_REDIS_MAXMEMORY:-0}
+      MINI_REDIS_MAXMEMORY_POLICY: ${MINI_REDIS_MAXMEMORY_POLICY:-noeviction}
+      MINI_REDIS_APPENDONLY: ${MINI_REDIS_APPENDONLY:-no}
+      MINI_REDIS_AOF_FILE: ${MINI_REDIS_AOF_FILE:-data/appendonly.aof}
+      MINI_REDIS_AOF_FSYNC: ${MINI_REDIS_AOF_FSYNC:-everysec}
+      MINI_REDIS_RDB_ENABLED: ${MINI_REDIS_RDB_ENABLED:-no}
+      MINI_REDIS_RDB_FILE: ${MINI_REDIS_RDB_FILE:-data/dump.rdb}
+      MINI_REDIS_RDB_SAVE_INTERVAL_SECONDS: ${MINI_REDIS_RDB_SAVE_INTERVAL_SECONDS:-0}
+      MINI_REDIS_CLIENT_IDLE_TIMEOUT_SECONDS: ${MINI_REDIS_CLIENT_IDLE_TIMEOUT_SECONDS:-30}
+      MINI_REDIS_WRITE_DRAIN_TIMEOUT_SECONDS: ${MINI_REDIS_WRITE_DRAIN_TIMEOUT_SECONDS:-5}
+      MINI_REDIS_MAX_INPUT_BUFFER_BYTES: ${MINI_REDIS_MAX_INPUT_BUFFER_BYTES:-1048576}
+      MINI_REDIS_MAX_OUTPUT_BUFFER_BYTES: ${MINI_REDIS_MAX_OUTPUT_BUFFER_BYTES:-262144}
+      MINI_REDIS_MAX_COMMANDS_PER_TICK: ${MINI_REDIS_MAX_COMMANDS_PER_TICK:-128}
+      MINI_REDIS_LOG_LEVEL: ${MINI_REDIS_LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data

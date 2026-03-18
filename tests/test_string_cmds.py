@@ -1,10 +1,20 @@
 import pytest
 
-from store.datastore import DataStore
-from store.expiry import ExpiryManager
-from commands.string_cmds import cmd_get, cmd_set, cmd_incr, cmd_decr, cmd_append
+from commands.string_cmds import (
+    cmd_append,
+    cmd_decr,
+    cmd_get,
+    cmd_incr,
+    cmd_incrby,
+    cmd_mget,
+    cmd_mset,
+    cmd_set,
+    cmd_strlen,
+)
 from commands.generic_cmds import cmd_ping, cmd_del, cmd_exists, cmd_ttl, cmd_expire
 from protocol.encoder import SimpleString, RespError
+from store.datastore import DataStore
+from store.expiry import ExpiryManager
 
 
 @pytest.fixture
@@ -33,7 +43,7 @@ class TestSetGet:
     def test_set_and_get(self, ctx):
         store, expiry = ctx
         assert cmd_set(store, expiry, ["foo", "bar"]) == SimpleString("OK")
-        assert cmd_get(store, expiry, ["foo"]) == "bar"
+        assert cmd_get(store, expiry, ["foo"]) == b"bar"
 
     def test_get_missing_key(self, ctx):
         store, expiry = ctx
@@ -43,7 +53,7 @@ class TestSetGet:
         store, expiry = ctx
         cmd_set(store, expiry, ["foo", "bar"])
         cmd_set(store, expiry, ["foo", "baz"])
-        assert cmd_get(store, expiry, ["foo"]) == "baz"
+        assert cmd_get(store, expiry, ["foo"]) == b"baz"
 
     def test_set_with_expiry(self, ctx):
         store, expiry = ctx
@@ -57,7 +67,7 @@ class TestSetGet:
         result = cmd_set(store, expiry, ["foo", "unsafe", "PX", "0"])
 
         assert result == RespError("ERR invalid expire time in 'set' command")
-        assert cmd_get(store, expiry, ["foo"]) == "safe"
+        assert cmd_get(store, expiry, ["foo"]) == b"safe"
 
     def test_invalid_set_does_not_create_key(self, ctx):
         store, expiry = ctx
@@ -68,8 +78,19 @@ class TestSetGet:
         assert cmd_get(store, expiry, ["foo"]) is None
 
 
-@pytest.mark.xfail(reason="INCR/DECR/APPEND are not implemented yet")
-class TestUnimplementedStringCommands:
+class TestStringCommands:
+    def test_mset_and_mget(self, ctx):
+        store, expiry = ctx
+
+        assert cmd_mset(store, expiry, ["k1", "v1", "k2", "v2"]) == SimpleString("OK")
+        assert cmd_mget(store, expiry, ["k1", "missing", "k2"]) == [b"v1", None, b"v2"]
+
+    def test_mset_rejects_odd_arity(self, ctx):
+        store, expiry = ctx
+        assert cmd_mset(store, expiry, ["k1", "v1", "k2"]) == RespError(
+            "ERR wrong number of arguments for 'mset' command"
+        )
+
     def test_incr_new_key(self, ctx):
         store, expiry = ctx
         assert cmd_incr(store, expiry, ["counter"]) == 1
@@ -88,10 +109,28 @@ class TestUnimplementedStringCommands:
         store, expiry = ctx
         cmd_set(store, expiry, ["foo", "bar"])
         assert cmd_append(store, expiry, ["foo", "baz"]) == 6
+        assert cmd_get(store, expiry, ["foo"]) == b"barbaz"
+
+    def test_incrby(self, ctx):
+        store, expiry = ctx
+        cmd_set(store, expiry, ["counter", "10"])
+        assert cmd_incrby(store, expiry, ["counter", "7"]) == 17
+
+    def test_strlen(self, ctx):
+        store, expiry = ctx
+        cmd_set(store, expiry, ["foo", "hello"])
+        assert cmd_strlen(store, expiry, ["foo"]) == 5
+        assert cmd_strlen(store, expiry, ["missing"]) == 0
+
+    def test_incr_rejects_non_integer_value(self, ctx):
+        store, expiry = ctx
+        cmd_set(store, expiry, ["counter", "abc"])
+        assert cmd_incr(store, expiry, ["counter"]) == RespError(
+            "ERR value is not an integer or out of range"
+        )
 
 
-@pytest.mark.xfail(reason="DEL/EXISTS/TTL/EXPIRE are not implemented yet")
-class TestUnimplementedGenericCommands:
+class TestGenericCommands:
     def test_del_existing(self, ctx):
         store, expiry = ctx
         cmd_set(store, expiry, ["foo", "bar"])

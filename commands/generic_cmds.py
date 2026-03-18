@@ -1,11 +1,12 @@
-"""
-Generic 명령어 핸들러 (팀원 C 담당)
+"""Handlers shared by every Redis data type.
 
-키 타입에 상관없이 모든 키에 적용되는 명령어들입니다.
+These commands either inspect key metadata or control lifecycle state such as
+TTL, deletion, and persistence-friendly absolute expiry.
 """
 
 from __future__ import annotations
 
+import time
 from typing import List, Any
 from store.datastore import DataStore
 from store.expiry import ExpiryManager
@@ -34,8 +35,6 @@ def cmd_del(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
 
     deleted = 0
     for key in args:
-        if not store.exists(key):
-            continue
         deleted += store.delete(key)
     return deleted
 
@@ -87,6 +86,28 @@ def cmd_persist(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any
         return 0
 
     expiry.remove_expiry(key)
+    return 1
+
+
+def cmd_pexpireat(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
+    if len(args) != 2:
+        return _wrong_number("pexpireat")
+
+    key, timestamp_ms_arg = args
+    try:
+        timestamp_ms = int(timestamp_ms_arg)
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    if not store.exists(key):
+        return 0
+
+    expiry_at = timestamp_ms / 1000.0
+    if expiry_at <= time.time():
+        store.delete(key, reason="expiry")
+        return 1
+
+    expiry.set_expiry_at(key, expiry_at)
     return 1
 
 

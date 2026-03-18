@@ -18,8 +18,7 @@ mini-redis 벤치마크 봇
   4. Message Queue - List 기반 큐 (LPUSH/RPOP)
   5. Leaderboard   - Sorted Set 순위표
   6. Cache vs DB   - Redis 캐시 앞단 vs MongoDB 직접 조회
-  7. Pub/Sub       - 발행-구독 메시지 전달 (실제 Redis만)
-  8. Pipeline      - 파이프라인 vs 개별 요청 비교
+  7. Pipeline      - 파이프라인 vs 개별 요청 비교
 
 결과:
   - 콘솔 테이블 출력
@@ -34,7 +33,6 @@ import csv
 import random
 import string
 import statistics
-import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -94,7 +92,6 @@ class BenchmarkConfig:
     queue_count: int
     leaderboard_players: int
     cache_hit_keys: int
-    pubsub_iterations: int
     startup_delay_seconds: float
     socket_timeout_seconds: float
     random_seed: Optional[int]
@@ -119,7 +116,6 @@ class BenchmarkConfig:
             queue_count=_env_int("BENCH_QUEUE_COUNT", 5),
             leaderboard_players=_env_int("BENCH_LEADERBOARD_PLAYERS", 500),
             cache_hit_keys=_env_int("BENCH_CACHE_HIT_KEYS", 100),
-            pubsub_iterations=_env_int("BENCH_PUBSUB_ITERATIONS", 200),
             startup_delay_seconds=_env_float("BENCH_STARTUP_DELAY_SECONDS", 3.0),
             socket_timeout_seconds=_env_float("BENCH_SOCKET_TIMEOUT_SECONDS", 5.0),
             random_seed=_env_optional_int("BENCH_RANDOM_SEED"),
@@ -573,75 +569,6 @@ def scenario_pipeline(r: redis.Redis, service: str) -> List[ScenarioResult]:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 시나리오 8: Pub/Sub (실제 Redis만 지원)
-# ─────────────────────────────────────────────────────────────────
-
-def scenario_pubsub(r_official: redis.Redis) -> ScenarioResult:
-    """
-    Publisher → Channel → Subscriber 메시지 전달 레이턴시 측정.
-
-    측정 방법:
-      - Subscriber 스레드가 채널을 구독
-      - Publisher가 타임스탬프가 포함된 메시지 발행
-      - Subscriber가 받은 시간 - 발행한 시간 = 전달 레이턴시
-
-    주의: mini-redis는 기본 Pub/Sub 구조가 서버 내부에 있어
-          이 시나리오는 redis-official로만 측정합니다.
-    """
-    channel = "bench:pubsub"
-    received_times = []
-    lock = threading.Lock()
-    done = threading.Event()
-    total_messages = CONFIG.pubsub_iterations
-
-    def subscriber_thread():
-        sub_client = redis.Redis(
-            host=CONFIG.redis_official_host,
-            port=CONFIG.redis_official_port,
-            decode_responses=True,
-            socket_timeout=CONFIG.socket_timeout_seconds,
-        )
-        pubsub = sub_client.pubsub()
-        pubsub.subscribe(channel)
-        count = 0
-        for msg in pubsub.listen():
-            if msg["type"] == "message":
-                recv_ts = time.perf_counter()
-                send_ts = float(msg["data"])
-                latency_ms = (recv_ts - send_ts) * 1000
-                with lock:
-                    received_times.append(latency_ms)
-                count += 1
-                if count >= total_messages:
-                    break
-        done.set()
-        pubsub.unsubscribe(channel)
-        sub_client.close()
-
-    t = threading.Thread(target=subscriber_thread, daemon=True)
-    t.start()
-    time.sleep(0.3)  # 구독자가 준비될 때까지 대기
-
-    errors = 0
-    for _ in range(total_messages):
-        try:
-            r_official.publish(channel, str(time.perf_counter()))
-            time.sleep(0.001)  # 1ms 간격으로 발행
-        except Exception:
-            errors += 1
-
-    done.wait(timeout=10)
-
-    return ScenarioResult(
-        service="redis-official",
-        scenario="8_pubsub_e2e_latency",
-        iterations=total_messages,
-        errors=errors,
-        latencies_ms=received_times,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────
 # 결과 출력 및 저장
 # ─────────────────────────────────────────────────────────────────
 
@@ -831,14 +758,6 @@ def main():
             print(f"    {svc} 완료")
         except Exception as e:
             print(f"    {svc} 스킵: {e}")
-
-    # ── 시나리오 8: Pub/Sub (redis-official만) ───────────────────
-    print("▶ 시나리오 8: Pub/Sub E2E Latency (redis-official only)")
-    try:
-        all_results.append(scenario_pubsub(r_official))
-        print("    redis-official 완료")
-    except Exception as e:
-        print(f"    스킵: {e}")
 
     # ── 결과 출력 및 저장 ────────────────────────────────────────
     print_results(all_results)
