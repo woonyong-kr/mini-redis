@@ -68,8 +68,7 @@ class TestSetGet:
         assert cmd_get(store, expiry, ["foo"]) is None
 
 
-@pytest.mark.xfail(reason="INCR/DECR/APPEND are not implemented yet")
-class TestUnimplementedStringCommands:
+class TestStringNumericAndAppendCommands:
     def test_incr_new_key(self, ctx):
         store, expiry = ctx
         assert cmd_incr(store, expiry, ["counter"]) == 1
@@ -90,8 +89,7 @@ class TestUnimplementedStringCommands:
         assert cmd_append(store, expiry, ["foo", "baz"]) == 6
 
 
-@pytest.mark.xfail(reason="DEL/EXISTS/TTL/EXPIRE are not implemented yet")
-class TestUnimplementedGenericCommands:
+class TestGenericKeyCommands:
     def test_del_existing(self, ctx):
         store, expiry = ctx
         cmd_set(store, expiry, ["foo", "bar"])

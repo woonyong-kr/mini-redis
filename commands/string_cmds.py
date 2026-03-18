@@ -46,6 +46,27 @@ def cmd_set(store, expiry, args):
 
     key = args[0]
     value = args[1]
+    ttl_seconds = None
+
+    if len(args) > 2:
+        if len(args) != 4:
+            return RespError("ERR syntax error")
+
+        option = args[2].upper()
+        raw_ttl = args[3]
+
+        if option not in {"EX", "PX"}:
+            return RespError("ERR syntax error")
+
+        try:
+            ttl_value = int(raw_ttl)
+        except ValueError:
+            return RespError("ERR value is not an integer or out of range")
+
+        if ttl_value <= 0:
+            return RespError("ERR invalid expire time in 'set' command")
+
+        ttl_seconds = float(ttl_value if option == "EX" else ttl_value / 1000)
 
     # 저장
     obj = make_string(value)
@@ -54,12 +75,10 @@ def cmd_set(store, expiry, args):
     # 기존 TTL 제거
     expiry.remove_expiry(key)
 
-    # EX 옵션만 최소 처리 (지금 단계)
-    if len(args) >= 4 and args[2].upper() == "EX":
-        seconds = int(args[3])
-        expiry.set_expiry(key, float(seconds))
+    if ttl_seconds is not None:
+        expiry.set_expiry(key, ttl_seconds)
 
-    return "OK"
+    return SimpleString("OK")
 
 
 def cmd_mget(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
