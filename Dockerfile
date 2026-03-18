@@ -11,4 +11,4 @@ COPY . .
 
 EXPOSE 6379
 
-CMD ["python", "server.py"]
+CMD ["python", "-u", "server.py"]
