@@ -1,176 +1,435 @@
-# mini-redis Hash Stack 설계 문서
+# 🔴 mini-redis
 
-## 프로젝트 개요
-이 저장소는 Redis-like 동작을 학습하고 구현하기 위한 Python 기반 mini-redis 프로젝트입니다.
+> Redis의 핵심 구조를 Python으로 직접 구현한 교육용 인메모리 데이터베이스
 
-이번 문서의 초점은 hash 자료구조 경로를 Python 내장 `dict`에 기대지 않고, 명시적으로 설계된 커스텀 해시 스택으로 구현하는 것입니다.
+기존 Redis 클라이언트(`redis-cli`, `redis-py`)가 **그대로 접속**할 수 있는 RESP 호환 서버입니다.  
+공식 Redis · mini-redis · MongoDB를 같은 시나리오로 벤치마크해 성능 차이를 수치로 비교할 수 있습니다.
 
-현재 저장소에는 hash 명령과 저장 계층의 스켈레톤이 존재하며, 이 문서는 구현 설계와 실제 반영 결과를 함께 정리합니다.
+---
 
-## 구현 상태
-- `store/hash_table.py`에 `BaseHashTable`, `OpenAddressHashTable`, `Hash`를 구현했습니다.
-- `store/datastore.py`의 hash 저장 경로는 내장 `dict` 대신 `Hash`를 사용하도록 연결했습니다.
-- `commands/hash_cmds.py`에 `HSET/HGET/HMSET/HMGET/HGETALL/HDEL/HEXISTS/HKEYS/HVALS/HLEN`을 구현했습니다.
-- 해시 전용 검증은 `tests/test_hash_table.py`, `tests/test_hash_cmds.py`에 추가했습니다.
+## 📋 목차
 
-## 최종 설계 요약
-- 해싱은 `store/hash_table.py`의 `murmurhash3_32()`에 있습니다.
-- probing과 resize는 `store/hash_table.py`의 `OpenAddressHashTable`에 있습니다.
-- compact representation과 promotion은 `store/hash_table.py`의 `Hash`에 있습니다.
-- seed 정책은 고정값 `0`입니다.
-- probe는 `index = (start + i * step) & (capacity - 1)` 방식이며, `step`은 같은 hash 결과에서 파생한 odd/non-zero 값으로 계산합니다.
+- [프로젝트 구조](#-프로젝트-구조)
+- [아키텍처](#-아키텍처)
+- [지원 명령어](#-지원-명령어)
+- [자료구조 구현](#-자료구조-구현)
+- [핵심 기능](#-핵심-기능)
+- [빠른 시작](#-빠른-시작)
+- [벤치마크](#-벤치마크)
+- [환경 변수](#-환경-변수)
+- [테스트](#-테스트)
 
-## 테스트 실행 예시
-가상 환경 기준:
+---
 
-```bash
-python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python -m pytest tests/test_hash_table.py tests/test_hash_cmds.py -v
+## 📁 프로젝트 구조
+
+```
+mini-redis/
+├── server.py                    # TCP 서버 진입점 (asyncio + uvloop)
+│
+├── protocol/                    # RESP 프로토콜 계층
+│   ├── parser.py                #   요청 파싱 (Array + Bulk String)
+│   └── encoder.py               #   응답 인코딩 (Simple String, Error, Integer, Bulk, Array)
+│
+├── commands/                    # 명령 핸들러 계층
+│   ├── dispatcher.py            #   명령 라우팅 테이블
+│   ├── string_cmds.py           #   String 명령 (GET, SET, INCR, MSET ...)
+│   ├── hash_cmds.py             #   Hash 명령 (HSET, HGET, HGETALL ...)
+│   ├── list_cmds.py             #   List 명령 (LPUSH, RPUSH, LPOP ...)
+│   ├── set_cmds.py              #   Set 명령 (SADD, SREM, SMEMBERS ...)
+│   ├── zset_cmds.py             #   Sorted Set 명령 (ZADD, ZRANGE ...)
+│   └── generic_cmds.py          #   범용 명령 (PING, DEL, EXPIRE, TTL ...)
+│
+├── store/                       # 저장 계층
+│   ├── redis_object.py          #   RedisObject 래퍼 (type + encoding + value)
+│   ├── datastore.py             #   메인 키스페이스 + 모든 자료형 메서드
+│   ├── hash_table.py            #   커스텀 해시 테이블 (MurmurHash3, Chaining, Open Addressing)
+│   ├── skiplist.py              #   스킵리스트 기반 Sorted Set
+│   ├── expiry.py                #   TTL 관리 (Lazy + Active Expiry)
+│   ├── persistence.py           #   영속성 (AOF + RDB)
+│   ├── memory.py                #   메모리 사용량 추정 (deep_getsizeof)
+│   └── errors.py                #   MemoryLimitError
+│
+├── benchmark/                   # 벤치마크 봇
+│   ├── benchmark.py             #   7개 시나리오 테스트 스크립트
+│   ├── Dockerfile               #   벤치마크 컨테이너
+│   └── requirements.txt         #   redis-py, pymongo
+│
+├── tests/                       # 테스트 코드
+├── docs/                        # 발표 자료
+├── Dockerfile                   # mini-redis 컨테이너
+├── docker-compose.yml           # 4개 서비스 오케스트레이션
+├── Makefile                     # 원커맨드 실행
+└── requirements.txt             # Python 의존성
 ```
 
-## 무엇을 구현할 예정인가
-다음 세 계층을 구현 대상으로 둡니다.
+---
 
-1. `BaseHashTable`
-2. `OpenAddressHashTable`
-3. `Hash`
+## 🏗 아키텍처
 
-각 계층의 역할은 다음과 같습니다.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Client (redis-cli / redis-py / ...)                            │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ TCP (RESP)
+┌────────────────────────▼────────────────────────────────────────┐
+│  server.py — asyncio + uvloop  (단일 이벤트 루프)                │
+│                                                                  │
+│  ┌──────────┐   ┌─────────────┐   ┌──────────────────────────┐  │
+│  │ parser.py│──>│dispatcher.py│──>│ *_cmds.py 핸들러          │  │
+│  └──────────┘   └─────────────┘   └────────────┬─────────────┘  │
+│  ┌──────────┐                                   │                │
+│  │encoder.py│<──────────────────────────────────┘                │
+│  └──────────┘                                                    │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                    store 계층                               │  │
+│  │  DataStore ← RedisObject(type, encoding, value)            │  │
+│  │  ├── String  : bytes  (ENC_RAW / ENC_INT)                  │  │
+│  │  ├── Hash    : compact list → ChainedHashTable             │  │
+│  │  ├── List    : collections.deque                           │  │
+│  │  ├── Set     : Python set                                  │  │
+│  │  └── ZSet    : dict + SkipList                             │  │
+│  │                                                             │  │
+│  │  ExpiryManager      — Lazy + Active Expiry                 │  │
+│  │  PersistenceManager — AOF (append) + RDB (snapshot)        │  │
+│  │  MemoryTracker      — maxmemory + eviction policy          │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-- `BaseHashTable`
-  - 공통 인터페이스를 정의합니다.
-- `OpenAddressHashTable`
-  - 실제 해시 테이블 동작을 담당합니다.
-  - 배열 기반 슬롯, 해싱, 프로빙, tombstone, 리사이즈를 가집니다.
-- `Hash`
-  - 상위 자료구조입니다.
-  - 작은 데이터에서는 compact representation을 사용하고, 커지면 hashtable로 승격합니다.
+**요청 처리 흐름:**
 
-## 무엇을 사용했는가
-이번 hash stack 설계는 아래 요소를 사용합니다.
+1. 클라이언트 TCP 연결 → `handle_client()` 코루틴 생성
+2. 바이트 스트림을 버퍼에 누적 → `parser.parse()`로 RESP 배열 파싱
+3. `dispatcher.dispatch()`가 명령 이름으로 핸들러 함수 탐색
+4. 핸들러가 `DataStore`의 메서드를 호출해 데이터 조작
+5. 결과를 `encoder.encode()`로 RESP 응답 바이트로 변환
+6. `writer.write()` → `writer.drain()`으로 클라이언트에 응답
 
-- MurmurHash3
-- Open Addressing with Double Hashing
-- tombstone deletion
-- compact representation + promotion
+---
 
-추가 의존성은 기본적으로 사용하지 않습니다.
+## 📌 지원 명령어
 
-## 왜 이것을 선택했는가
+### String (9개)
 
-### MurmurHash3
-- 비교적 단순하게 프로젝트 내부에 직접 구현할 수 있습니다.
-- 빠르고 분산이 좋아 커스텀 해시 테이블 실험에 적합합니다.
-- seed 정책을 명시하면 테스트와 재현성이 좋아집니다.
+| 명령 | 설명 | 구현 위치 |
+|------|------|-----------|
+| `GET key` | 키의 문자열 값 조회 | `string_cmds.py` |
+| `SET key value [EX s] [PX ms]` | 문자열 저장 + 선택적 TTL | `string_cmds.py` |
+| `MGET key [key ...]` | 여러 키 동시 조회 | `string_cmds.py` |
+| `MSET key value [key value ...]` | 여러 키 동시 저장 (롤백 지원) | `string_cmds.py` |
+| `INCR key` | 값을 정수로 해석하여 +1 | `string_cmds.py` |
+| `DECR key` | 값을 정수로 해석하여 -1 | `string_cmds.py` |
+| `INCRBY key increment` | 정수 값을 지정량만큼 증가 | `string_cmds.py` |
+| `APPEND key value` | 기존 값 뒤에 이어 붙이기 | `string_cmds.py` |
+| `STRLEN key` | 문자열 바이트 길이 반환 | `string_cmds.py` |
 
-### Open Addressing with Double Hashing
-- 별도 체이닝 구조 없이 배열 기반으로 동작을 통제할 수 있습니다.
-- 충돌이 발생했을 때 probe sequence를 명확하게 설명하고 테스트하기 좋습니다.
-- second hash를 활용해 선형 탐사보다 군집화 문제를 줄이는 방향을 취할 수 있습니다.
+**구현 포인트:**
+- 내부 저장은 `bytes` 기반. 정수 변환 가능 여부에 따라 `ENC_INT` / `ENC_RAW` 인코딩 구분
+- `MSET`은 도중 실패 시 모든 키를 이전 상태로 **롤백** (스냅샷 기반)
+- `INCR/DECR`은 `INCRBY`에 위임하는 delegation 패턴
 
-### Tombstone deletion
-- open addressing에서 삭제 후 탐색 정확성을 유지하기 위한 핵심 전략입니다.
-- 삭제된 슬롯을 즉시 비움 처리하지 않고 tombstone으로 표시하면, 그 뒤에 있는 키 탐색이 끊기지 않습니다.
-- insert 시 tombstone 재사용 정책을 별도로 테스트할 수 있어 구현 통제가 분명합니다.
+### Hash (10개)
 
-### Compact representation + promotion
-- 작은 hash는 단순 선형 탐색 구조가 더 읽기 쉽고 구현 비용이 낮습니다.
-- 데이터가 커졌을 때만 hashtable로 승격하면 작은 데이터와 큰 데이터 양쪽에서 균형 잡힌 설계를 만들 수 있습니다.
-- Redis-like 자료구조의 “작을 때는 compact, 커지면 승격” 흐름을 학습하기 좋습니다.
+| 명령 | 설명 |
+|------|------|
+| `HSET key field value [field value ...]` | 필드 설정 (새 필드 수 반환) |
+| `HGET key field` | 단일 필드 조회 |
+| `HMSET key field value [...]` | 여러 필드 설정 |
+| `HMGET key field [field ...]` | 여러 필드 조회 |
+| `HGETALL key` | 모든 field-value 쌍 반환 |
+| `HDEL key field [field ...]` | 필드 삭제 |
+| `HEXISTS key field` | 필드 존재 여부 |
+| `HKEYS key` | 모든 필드명 |
+| `HVALS key` | 모든 값 |
+| `HLEN key` | 필드 수 |
 
-## 핵심 정책
+**구현 포인트:**
+- 작은 해시 → `compact list` (튜플 리스트, O(n) 탐색이지만 메모리 절약)
+- 필드 32개 초과 또는 값 64바이트 초과 시 → `ChainedHashTable`로 자동 승격
+- 해시 함수: **MurmurHash3 x86 32-bit** 직접 구현 (seed=0 고정 정책)
+- `OpenAddressHashTable` (Double Hashing + Tombstone)도 별도 구현하여 비교 가능
 
-### 해싱
-- 알고리즘: MurmurHash3
-- seed: `0`
+### List (8개)
 
-### 충돌 해결
-- 방식: Open Addressing with Double Hashing
-- probe sequence는 결정적이어야 합니다.
-- second hash / probe step은 `0`이 아니어야 합니다.
-- capacity가 2의 거듭제곱일 때 전체 테이블을 순회할 수 있어야 합니다.
+| 명령 | 설명 |
+|------|------|
+| `LPUSH key value [value ...]` | 왼쪽에 추가 |
+| `RPUSH key value [value ...]` | 오른쪽에 추가 |
+| `LPOP key` | 왼쪽에서 꺼내기 |
+| `RPOP key` | 오른쪽에서 꺼내기 |
+| `LRANGE key start stop` | 범위 조회 (음수 인덱스 지원) |
+| `LLEN key` | 리스트 길이 |
+| `LINDEX key index` | 특정 인덱스 조회 |
+| `LSET key index value` | 특정 인덱스 값 변경 |
 
-### 삭제
-- tombstone 전략을 사용합니다.
-- lookup은 tombstone을 지나 계속 진행해야 합니다.
-- insert는 첫 tombstone을 기억하되, 뒤에 같은 키가 있는지 먼저 확인한 후에만 재사용합니다.
+**구현 포인트:** `collections.deque` 기반으로 양끝 push/pop O(1)
 
-### 리사이즈
-- initial capacity = `8`
-- grow when `used / capacity > 0.7`
-- grow target = `capacity * 2`
-- shrink when `live_count / capacity < 0.2`
-- shrink target = `max(8, capacity // 2)`
+### Set (8개)
 
-정의:
-- `live_count`: 현재 살아 있는 엔트리 수
-- `used`: live entry + tombstone 수
+| 명령 | 설명 |
+|------|------|
+| `SADD key member [member ...]` | 멤버 추가 |
+| `SREM key member [member ...]` | 멤버 제거 |
+| `SMEMBERS key` | 전체 멤버 (정렬된 결과) |
+| `SISMEMBER key member` | 멤버 존재 여부 |
+| `SCARD key` | 멤버 수 |
+| `SINTER key [key ...]` | 교집합 |
+| `SUNION key [key ...]` | 합집합 |
+| `SDIFF key [key ...]` | 차집합 |
 
-리사이즈 시에는 live entry만 재삽입하고 tombstone은 버립니다.
+**구현 포인트:** Python `set` 기반, 집합 연산은 built-in `&`, `|`, `-` 연산자 활용
 
-### Compact mode와 promotion
-- 기본 compact 유지 조건:
-  - entry count `<= 32`
-  - `max(field length, value length) <= 64 bytes`
-- compact 표현은 `(field, value)` 쌍의 명시적 리스트 기반을 기본안으로 사용합니다.
-- 임계치를 넘으면 `OpenAddressHashTable`로 promotion 합니다.
-- promotion 후에도 논리적 내용은 유지되어야 합니다.
+### Sorted Set (8개)
 
-## 저장소 내 예상 반영 위치
-현재 저장소 기준으로 예상되는 반영 위치는 다음과 같습니다.
+| 명령 | 설명 |
+|------|------|
+| `ZADD key score member [score member ...]` | 멤버 추가/업데이트 |
+| `ZREM key member [member ...]` | 멤버 제거 |
+| `ZSCORE key member` | 점수 조회 |
+| `ZRANK key member` | 오름차순 순위 |
+| `ZRANGE key start stop [WITHSCORES]` | 오름차순 범위 조회 |
+| `ZREVRANGE key start stop [WITHSCORES]` | 내림차순 범위 조회 |
+| `ZCARD key` | 멤버 수 |
+| `ZRANGEBYSCORE key min max` | 점수 범위 조회 |
 
-- `store/hash_table.py`
-  - hash 코어 구현
-- `store/datastore.py`
-  - hash 저장 경로 연결
-- `commands/hash_cmds.py`
-  - hash 명령 구현
-- `tests/test_hash_table.py`
-  - 해시 테이블 단위 테스트
-- `tests/test_hash_cmds.py`
-  - 명령/스토어 통합 테스트
+**구현 포인트:**
+- **SkipList** 직접 구현 (최대 16레벨, P=0.25)
+- `dict(member → score)` + `SkipList(score, member)` 이중 인덱스
+- `dict`로 O(1) 점수 조회, SkipList로 O(log n) 범위/순위 조회
 
-이 범위를 넘는 광범위한 마이그레이션은 기본 계획에 포함하지 않습니다.
+### Generic (10개)
 
-## 현재 상태와 목표 상태
+| 명령 | 설명 |
+|------|------|
+| `PING [message]` | 연결 확인 |
+| `DEL key [key ...]` | 키 삭제 |
+| `EXISTS key [key ...]` | 키 존재 확인 |
+| `EXPIRE key seconds` | TTL 설정 |
+| `TTL key` | 남은 TTL 조회 |
+| `PERSIST key` | TTL 제거 |
+| `PEXPIREAT key ms-timestamp` | 절대 시각 TTL (영속성 복구용) |
+| `TYPE key` | 키의 자료형 반환 |
+| `KEYS pattern` | 패턴 매칭 키 목록 |
+| `FLUSHALL` | 전체 데이터 삭제 |
 
-### 현재 상태
-- hash 저장 경로는 커스텀 `Hash` / `OpenAddressHashTable`로 연결되어 있습니다.
-- hash 명령 경로는 동작 가능한 상태이며, Redis-like 응답 형태를 반환합니다.
-- 해시 전용 테스트가 추가되어 probing, tombstone, resize, promotion을 검증합니다.
+---
 
-### 목표 상태
-- hash 저장 경로가 커스텀 `Hash` / `OpenAddressHashTable`로 동작합니다.
-- 해싱, 프로빙, tombstone, 리사이즈, promotion 정책이 코드와 테스트에서 확인 가능합니다.
-- hash 관련 명령이 일관된 Redis-like 동작을 제공합니다.
+## 🔧 자료구조 구현
 
-## 테스트 및 검증 계획
-구현 시 아래 시나리오를 테스트 대상으로 둡니다.
+### RedisObject — 통합 값 래퍼
 
-- insert
-- update existing key
-- lookup hit / miss
-- delete
-- tombstone-aware lookup
-- tombstone reuse on insert
-- collision-heavy cases
-- grow resize
-- shrink resize
-- compact-to-hashtable promotion
-- behavior preservation after promotion
-- repeated delete / reinsert edge cases
+모든 키는 `RedisObject(type, encoding, value)`로 감싸져 저장됩니다.
 
-## 제한사항
-- 대상 hash-table 동작에 Python 내장 `dict`를 사용하지 않습니다.
-- built-in `dict`를 전역적으로 대체하지 않습니다.
-- dependency는 기본적으로 추가하지 않습니다.
-- public API를 바꾸는 방향은 사전 승인 없이는 진행하지 않습니다.
+```python
+class RedisObject:
+    __slots__ = ("type", "encoding", "value", "refcount")
+```
 
-## 후속 아이디어
-아래 항목은 구현 이후 검토할 수 있는 후속 주제입니다.
+| type | encoding | Python 자료형 |
+|------|----------|--------------|
+| `string` | `raw` / `int` | `bytes` |
+| `hash` | `dict` / `hashtable` | `dict` → `Hash` (compact → ChainedHashTable) |
+| `list` | `deque` | `collections.deque` |
+| `set` | `hashtable` | `set` |
+| `zset` | `skiplist` | `ZSet` (dict + SkipList) |
 
-- hash 내부 통계 정보 노출 여부 검토
-- probe 길이와 충돌 패턴 관찰용 디버그 도구 추가
-- compact threshold 튜닝 실험
-- hash 외 자료구조에도 유사한 설계 원칙을 적용할지 검토
+### Hash Table — MurmurHash3 + 이중 구현
+
+`hash_table.py`에 두 가지 해시 테이블을 구현했습니다:
+
+1. **ChainedHashTable** (Separate Chaining) — 런타임 기본값
+   - 버킷 배열 + 연결 리스트
+   - Load factor > 0.7 → capacity × 2 확장
+   - Load factor < 0.2 → capacity ÷ 2 축소
+
+2. **OpenAddressHashTable** (Double Hashing) — 비교/학습용
+   - Tombstone 기반 삭제
+   - Double hashing: `step = (hash >> 16) ^ (hash << 1) | 1`
+   - Power-of-two capacity로 모듈러 연산 최적화
+
+### SkipList — O(log n) 순위 조회
+
+```
+Level 3: [H] ──────────────────────────────> [D] ──> nil
+Level 2: [H] ──────────> [B] ──────────────> [D] ──> nil
+Level 1: [H] ──> [A] ──> [B] ──> [C] ──────> [D] ──> nil
+Level 0: [H] ──> [A] ──> [B] ──> [C] ──> [D]──>nil
+```
+
+- 최대 16레벨, 승격 확률 P=0.25
+- `span` 배열로 rank 계산 O(log n)
+- insert, delete, rank 모두 O(log n)
+
+---
+
+## ⚡ 핵심 기능
+
+### 서버 — 단일 이벤트 루프 (asyncio + uvloop)
+
+Redis 원본과 동일한 **단일 스레드 + I/O 멀티플렉싱** 구조:
+- `uvloop`으로 기본 asyncio 대비 2~4배 성능 향상
+- 연결별 코루틴이 `await`에서 양보 → 이벤트 루프가 다른 연결 처리
+
+**클라이언트 보호 장치:**
+
+| 보호 항목 | 기본값 | 설명 |
+|----------|--------|------|
+| Idle timeout | 30s | 유휴 연결 자동 종료 |
+| Write drain timeout | 5s | 느린 클라이언트 차단 |
+| Max input buffer | 1MB | 과도한 요청 차단 |
+| Max output buffer | 256KB | 메모리 보호 |
+| Max commands/tick | 128 | 이벤트 루프 독점 방지 |
+
+### TTL 관리 — Lazy + Active 이중 전략
+
+- **Lazy Expiry:** `GET`, `EXISTS` 등 읽기 시 만료 확인 → 즉시 삭제
+- **Active Expiry:** 백그라운드 루프가 100ms마다 만료 키 20개 샘플링
+  - 샘플에서 만료 비율이 25% 이상이면 같은 주기에 추가 패스 (최대 4회)
+  - 전체 스캔 없이 효율적으로 만료 키 정리
+
+### 영속성 — AOF + RDB
+
+| 항목 | AOF | RDB |
+|------|-----|-----|
+| 기록 방식 | 쓰기 명령을 RESP 형태로 append | 전체 상태를 스냅샷으로 저장 |
+| fsync | `always` / `everysec` / `no` | 저장 시점에 한 번 |
+| 복구 | 명령 재실행 (replay) | 스냅샷 로드 |
+| 우선순위 | ✅ AOF 우선 | AOF 없을 때 RDB |
+
+### 메모리 관리 — maxmemory + Eviction
+
+`deep_getsizeof()`로 Python 객체 크기를 재귀 계측:
+
+| eviction 정책 | 설명 |
+|---------------|------|
+| `noeviction` | 한도 초과 시 쓰기 거부 (기본값) |
+| `allkeys-random` | 무작위 키 삭제 |
+| `allkeys-lru` | 가장 오래 접근하지 않은 키 삭제 |
+| `volatile-ttl` | TTL이 설정된 키 중 만료 임박한 키 우선 삭제 |
+
+---
+
+## 🚀 빠른 시작
+
+### 로컬 실행
+
+```bash
+# 의존성 설치
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 서버 실행
+python server.py --host 0.0.0.0 --port 6379
+
+# 다른 터미널에서 접속
+./redis-cli -p 6379
+> PING
+PONG
+> SET hello world
+OK
+> GET hello
+"world"
+```
+
+### Docker + 벤치마크 (원커맨드)
+
+```bash
+make run
+```
+
+이 명령 하나로:
+1. ✅ OS 감지 (Mac / Windows)
+2. ✅ Python venv 생성 + 패키지 설치
+3. ✅ 기존 컨테이너 / 포트 정리
+4. ✅ Redis + mini-redis + MongoDB + 벤치마크 봇 빌드 & 실행
+
+```bash
+make help     # 사용 가능한 명령어 안내
+make down     # 컨테이너 종료
+make bench    # 벤치마크만 재실행
+make clean    # 전체 정리
+```
+
+---
+
+## 📊 벤치마크
+
+### 7개 비교 시나리오
+
+| # | 시나리오 | 사용 명령 | 측정 포인트 |
+|---|---------|----------|------------|
+| 1 | **KV Cache** | GET / SET | 기본 읽기/쓰기 레이턴시 |
+| 2 | **Session Store** | HSET / HGETALL | Hash 연산 성능 |
+| 3 | **Rate Limiting** | INCR + EXPIRE | 원자적 카운터 속도 |
+| 4 | **Message Queue** | LPUSH / RPOP | Producer/Consumer 처리량 |
+| 5 | **Leaderboard** | ZADD / ZREVRANGE | Sorted Set 순위 성능 |
+| 6 | **Cache vs DB** | Redis + MongoDB | Cache Hit / Miss / 직접 조회 비교 |
+| 7 | **Pipeline** | 배치 SET | 개별 요청 vs 파이프라인 RTT 절감 |
+
+### 측정 지표
+
+| 지표 | 설명 |
+|------|------|
+| Mean (ms) | 평균 레이턴시 |
+| P50 (ms) | 중앙값 |
+| P95 (ms) | 상위 5% 느린 요청 |
+| P99 (ms) | 상위 1% 가장 느린 요청 |
+| Throughput (ops/sec) | 초당 처리량 |
+| Error rate (%) | 에러/미구현 비율 |
+
+### 결과 파일
+
+벤치마크 실행 후 `benchmark/results/`에 저장:
+- `report.json` — 전체 결과 (프로그래밍용)
+- `report.csv` — 표 형태 (스프레드시트 분석용)
+
+---
+
+## ⚙ 환경 변수
+
+`.env` 파일 또는 `docker-compose.yml`의 `environment`에서 설정:
+
+### 서버 설정
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `MINI_REDIS_HOST` | `127.0.0.1` | 바인드 주소 |
+| `MINI_REDIS_PORT` | `6379` | 리스닝 포트 |
+| `MINI_REDIS_MAXMEMORY` | `0` (무제한) | 최대 메모리 (예: `128mb`) |
+| `MINI_REDIS_MAXMEMORY_POLICY` | `noeviction` | eviction 정책 |
+| `MINI_REDIS_APPENDONLY` | `no` | AOF 활성화 |
+| `MINI_REDIS_RDB_ENABLED` | `no` | RDB 활성화 |
+| `MINI_REDIS_LOG_LEVEL` | `INFO` | 로그 레벨 |
+
+### 벤치마크 설정
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `BENCH_ITERATIONS` | `1000` | 시나리오별 반복 횟수 |
+| `BENCH_WARMUP` | `100` | 워밍업 반복 횟수 |
+| `BENCH_PIPELINE_BATCH` | `100` | 파이프라인 배치 크기 |
+| `BENCH_VALUE_SIZE` | `32` | 테스트 값 크기 (바이트) |
+| `BENCH_RANDOM_SEED` | (없음) | 재현 가능 테스트용 시드 |
+
+---
+
+## 🧪 테스트
+
+```bash
+# 전체 테스트
+pytest
+
+# 특정 테스트
+pytest tests/test_string_cmds.py -v
+pytest tests/test_hash_table.py -v
+pytest tests/test_server_integration.py -v
+```
+
+---
+
+## 📄 라이선스
+
+교육 목적 프로젝트입니다.
