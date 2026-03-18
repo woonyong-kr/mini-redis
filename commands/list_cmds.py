@@ -2,18 +2,15 @@
 List 명령어 핸들러 (팀원 D 담당)
 """
 
-from typing import List
+from typing import List, Any
 from store.datastore import DataStore
 from store.expiry import ExpiryManager
-from protocol.encoder import (
-    encode_simple_string, encode_bulk_string,
-    encode_error, encode_integer, encode_array
-)
+from protocol.encoder import SimpleString, RespError
 
 WRONGTYPE_ERROR = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
 
-def cmd_lpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_lpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LPUSH key value [value ...]
     왼쪽에 추가. 여러 값은 왼쪽부터 순서대로 추가됩니다.
@@ -22,7 +19,7 @@ def cmd_lpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes
     raise NotImplementedError
 
 
-def cmd_rpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_rpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     RPUSH key value [value ...]
     오른쪽에 추가.
@@ -31,7 +28,7 @@ def cmd_rpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes
     raise NotImplementedError
 
 
-def cmd_lpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_lpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LPOP key
     왼쪽에서 꺼냅니다.
@@ -40,7 +37,7 @@ def cmd_lpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
     raise NotImplementedError
 
 
-def cmd_rpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_rpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     RPOP key
     오른쪽에서 꺼냅니다.
@@ -49,7 +46,7 @@ def cmd_rpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
     raise NotImplementedError
 
 
-def cmd_lrange(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_lrange(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LRANGE key start stop
     start부터 stop까지의 원소를 반환합니다.
@@ -59,7 +56,7 @@ def cmd_lrange(store: DataStore, expiry: ExpiryManager, args: List[str]) -> byte
     raise NotImplementedError
 
 
-def cmd_llen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_llen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LLEN key
     반환: 리스트 길이 (integer). 키 없으면 0.
@@ -67,7 +64,7 @@ def cmd_llen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
     raise NotImplementedError
 
 
-def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LINDEX key index
     특정 인덱스의 원소를 반환합니다.
@@ -76,7 +73,7 @@ def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> byte
     raise NotImplementedError
 
 
-def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> bytes:
+def cmd_lset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     LSET key index value
     특정 인덱스의 원소를 변경합니다.

@@ -5,13 +5,13 @@
 팀원들이 각 명령어를 구현하면, 이 파일에 등록합니다.
 """
 
-from typing import List, Callable, Dict
+from typing import List, Callable, Dict, Any
 from store.datastore import DataStore
 from store.expiry import ExpiryManager
-from protocol.encoder import encode_error
+from protocol.encoder import RespError
 
-# 명령어 핸들러 타입
-HandlerType = Callable[[DataStore, ExpiryManager, List[str]], bytes]
+# 명령어 핸들러 타입 (bytes 대신 Any 반환 - 인코딩은 server.py에서 담당)
+HandlerType = Callable[[DataStore, ExpiryManager, List[str]], Any]
 
 
 def build_command_table() -> Dict[str, HandlerType]:
@@ -119,29 +119,32 @@ def dispatch(
     command: List[str],
     store: DataStore,
     expiry: ExpiryManager
-) -> bytes:
+) -> Any:
     """
     파싱된 명령어를 받아 적절한 핸들러를 실행합니다.
+    인코딩은 하지 않고 Python 값을 그대로 반환합니다.
+    인코딩은 server.py에서 encode()를 호출해 처리합니다.
 
     예:
       command = ["SET", "foo", "bar"]
       → cmd_set(store, expiry, ["foo", "bar"]) 호출
+      → SimpleString("OK") 반환
 
-    알 수 없는 명령어는 ERR 반환.
+    알 수 없는 명령어는 RespError 반환.
     """
     if not command:
-        return encode_error("ERR empty command")
+        return RespError("ERR empty command")
 
     cmd_name = command[0].upper()
     args = command[1:]
 
     handler = COMMAND_TABLE.get(cmd_name)
     if handler is None:
-        return encode_error(f"ERR unknown command '{cmd_name}'")
+        return RespError(f"ERR unknown command '{cmd_name}'")
 
     try:
         return handler(store, expiry, args)
     except NotImplementedError:
-        return encode_error(f"ERR command '{cmd_name}' is not yet implemented")
+        return RespError(f"ERR command '{cmd_name}' is not yet implemented")
     except Exception as e:
-        return encode_error(f"ERR internal error: {str(e)}")
+        return RespError(f"ERR internal error: {str(e)}")
