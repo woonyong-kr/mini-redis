@@ -10,8 +10,8 @@ Redis의 모든 값은 타입에 상관없이 RedisObject 하나로 표현됩니
   - refcount: 참조 카운트 (현재는 구조 반영용, 항상 1)
 
 예시:
-  SET foo bar  →  RedisObject(type="string", encoding="raw",  value="bar")
-  HSET h f v   →  RedisObject(type="hash",   encoding="dict", value={"f": "v"})
+  SET foo bar  →  RedisObject(type="string", encoding="raw",       value="bar")
+  HSET h f v   →  RedisObject(type="hash",   encoding="hashtable", value=<Hash>)
 """
 
 from typing import Any
@@ -32,7 +32,7 @@ TYPE_NONE   = "none"   # 키가 존재하지 않을 때
 # ─────────────────────────────────────────
 ENC_RAW       = "raw"       # 일반 문자열
 ENC_INT       = "int"       # 정수로 변환 가능한 문자열 (최적화용)
-ENC_DICT      = "dict"      # Python dict (Hash, ZSet 임시 구현)
+ENC_DICT      = "dict"      # Python dict (호환용 / ZSet 임시 구현)
 ENC_DEQUE     = "deque"     # collections.deque (List)
 ENC_HASHTABLE = "hashtable" # Python set (Set)
 ENC_SKIPLIST  = "skiplist"  # ZSet 전용 (현재는 dict로 구현, 추후 교체)
@@ -72,26 +72,39 @@ class RedisObject:
 # ─────────────────────────────────────────
 
 def make_string(value: str) -> RedisObject:
+
     """
     String 타입 RedisObject 생성.
     값이 정수로 변환 가능하면 ENC_INT, 아니면 ENC_RAW 인코딩 사용.
-
-    예: make_string("hello") → encoding="raw",  value="hello"
-        make_string("42")    → encoding="int",  value="42"
     """
-    # 정수로 변환 가능한 문자열이면 int 인코딩으로 최적화
-    encoding = ENC_INT if _is_integer_string(value) else ENC_RAW
-    return RedisObject(TYPE_STRING, encoding, value)
 
+    # 1. 입력 검증
+    if value is None:
+        raise ValueError("value cannot be None")
 
-def make_hash(value: dict = None) -> RedisObject:
+    # 2. 인코딩 결정 (핵심 로직)
+    if _is_integer_string(value):
+        encoding = ENC_INT
+    else:
+        encoding = ENC_RAW
+
+    # 3. RedisObject 생성
+    obj = RedisObject(TYPE_STRING, encoding, value)
+
+    return obj
+
+def make_hash(value: Any = None) -> RedisObject:
     """
     Hash 타입 RedisObject 생성.
-    value는 Python dict를 사용합니다. (추후 직접 구현한 해시로 교체 예정)
+    value는 커스텀 Hash 또는 dict 호환 입력을 받을 수 있습니다.
 
-    예: make_hash({"field": "value"})
+    예: make_hash(custom_hash)
     """
-    return RedisObject(TYPE_HASH, ENC_DICT, value if value is not None else {})
+    if value is None:
+        return RedisObject(TYPE_HASH, ENC_DICT, {})
+    if isinstance(value, dict):
+        return RedisObject(TYPE_HASH, ENC_DICT, value)
+    return RedisObject(TYPE_HASH, ENC_HASHTABLE, value)
 
 
 def make_list(value=None) -> RedisObject:

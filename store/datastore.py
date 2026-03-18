@@ -5,14 +5,16 @@
 각 메서드를 구현하세요. 메서드 이름과 파라미터는 변경하지 마세요.
 """
 
+from __future__ import annotations
+
 import fnmatch
 from collections import deque
 from typing import Optional, Any, List, Callable
 
+from store.hash_table import Hash
 from store.redis_object import (
     RedisObject,
     TYPE_STRING, TYPE_HASH, TYPE_LIST, TYPE_SET, TYPE_ZSET, TYPE_NONE,
-    make_string, make_hash, make_list, make_set, make_zset,
 )
 
 
@@ -21,15 +23,15 @@ class DataStore:
     인메모리 키-값 스토어.
 
     내부 구조:
-      self._data: dict  - 실제 데이터 저장
-                          {"key": RedisObject} 형태
-                          RedisObject.type으로 Hash/ZSet 등 타입 구분 가능
+      self._data: dict
+        {"key": RedisObject} 형태
+        hash 타입의 RedisObject.value는 커스텀 Hash를 사용한다.
     """
 
     def __init__(self):
-        # 키 → RedisObject 매핑
         self._data: dict[str, RedisObject] = {}
         self._delete_hooks: list[Callable[[str], None]] = []
+        self._expiry_manager = None
 
     # ─────────────────────────────────────────
     # 범용 메서드
@@ -39,11 +41,22 @@ class DataStore:
         """키 삭제 시 호출할 훅을 등록합니다."""
         self._delete_hooks.append(hook)
 
+    def bind_expiry_manager(self, expiry_manager) -> None:
+        """만료 확인용 ExpiryManager를 연결합니다."""
+        self._expiry_manager = expiry_manager
+
+    def _purge_if_expired(self, key: str) -> None:
+        if self._expiry_manager is None:
+            return
+        if self._expiry_manager.is_expired(key):
+            self.delete(key)
+
     def get(self, key: str) -> Optional[RedisObject]:
         """
         키에 저장된 RedisObject를 반환합니다.
         키가 없으면 None을 반환합니다.
         """
+        self._purge_if_expired(key)
         return self._data.get(key)
 
     def set(self, key: str, obj: RedisObject) -> None:
@@ -79,15 +92,15 @@ class DataStore:
         """
         키의 존재 여부를 반환합니다.
         """
+        self._purge_if_expired(key)
         return key in self._data
 
     def get_type(self, key: str) -> str:
         """
         키에 저장된 값의 Redis 타입을 반환합니다.
         반환값: "string" | "hash" | "list" | "set" | "zset" | "none"
-
-        RedisObject.type으로 바로 구분하므로 Hash/ZSet 혼동 없음.
         """
+        self._purge_if_expired(key)
         obj = self._data.get(key)
         if obj is None:
             return TYPE_NONE
@@ -97,12 +110,13 @@ class DataStore:
         """
         패턴에 매칭되는 키 목록을 반환합니다.
         pattern="*" 이면 전체 키를 반환합니다.
-
-        fnmatch 모듈로 글로브 패턴 지원 (*, ?, [...])
         """
+        for key in list(self._data.keys()):
+            self._purge_if_expired(key)
+
         if pattern == "*":
             return list(self._data.keys())
-        return [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+        return [key for key in self._data if fnmatch.fnmatch(key, pattern)]
 
     def flush(self) -> None:
         """
@@ -118,64 +132,93 @@ class DataStore:
     # Hash 전용 메서드
     # ─────────────────────────────────────────
 
+    def _get_hash_table(self, key: str) -> Optional[Hash]:
+        obj = self.get(key)
+        if obj is None:
+            return None
+        if obj.type != TYPE_HASH:
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+        if isinstance(obj.value, Hash):
+            return obj.value
+
+        # 원격 dev의 dict 기반 hash와도 호환되도록 lazy migration 지원
+        migrated = Hash()
+        if isinstance(obj.value, dict):
+            for field, value in obj.value.items():
+                migrated.set(field, value)
+        obj.value = migrated
+        obj.encoding = "hashtable"
+        return migrated
+
     def hget(self, key: str, field: str) -> Optional[str]:
         """Hash에서 특정 필드의 값을 반환합니다."""
-        raise NotImplementedError
+        hash_value = self._get_hash_table(key)
+        if hash_value is None:
+            return None
+        return hash_value.get(field)
 
     def hset(self, key: str, field: str, value: str) -> int:
         """
         Hash에 필드를 설정합니다.
         반환: 새로 추가된 필드면 1, 업데이트면 0
         """
-        raise NotImplementedError
+        hash_value = self._get_hash_table(key)
+        if hash_value is None:
+            hash_value = Hash()
+            self._data[key] = RedisObject(TYPE_HASH, "hashtable", hash_value)
+        return 1 if hash_value.set(field, value) else 0
 
     def hdel(self, key: str, *fields: str) -> int:
         """Hash에서 필드를 삭제합니다. 반환: 삭제된 수"""
-        raise NotImplementedError
+        hash_value = self._get_hash_table(key)
+        if hash_value is None:
+            return 0
+
+        deleted = 0
+        for field in fields:
+            if hash_value.delete(field):
+                deleted += 1
+
+        if len(hash_value) == 0:
+            self.delete(key)
+
+        return deleted
 
     def hgetall(self, key: str) -> dict:
         """Hash의 모든 필드와 값을 반환합니다."""
-        raise NotImplementedError
+        hash_value = self._get_hash_table(key)
+        if hash_value is None:
+            return {}
+        return {field: value for field, value in hash_value.items()}
 
     def hexists(self, key: str, field: str) -> bool:
         """Hash에 필드가 존재하는지 확인합니다."""
-        raise NotImplementedError
+        hash_value = self._get_hash_table(key)
+        if hash_value is None:
+            return False
+        return hash_value.contains(field)
 
     # ─────────────────────────────────────────
     # List 전용 메서드
     # ─────────────────────────────────────────
 
     def lpush(self, key: str, *values: str) -> int:
-        """
-        List 왼쪽에 값을 추가합니다.
-        반환: 추가 후 리스트 길이
-        """
         raise NotImplementedError
 
     def rpush(self, key: str, *values: str) -> int:
-        """
-        List 오른쪽에 값을 추가합니다.
-        반환: 추가 후 리스트 길이
-        """
         raise NotImplementedError
 
     def lpop(self, key: str) -> Optional[str]:
-        """List 왼쪽에서 값을 꺼냅니다. 비어있으면 None."""
         raise NotImplementedError
 
     def rpop(self, key: str) -> Optional[str]:
-        """List 오른쪽에서 값을 꺼냅니다. 비어있으면 None."""
         raise NotImplementedError
 
     def lrange(self, key: str, start: int, stop: int) -> List[str]:
-        """
-        List의 start~stop 범위를 반환합니다.
-        음수 인덱스 지원: -1은 마지막 원소
-        """
         raise NotImplementedError
 
     def llen(self, key: str) -> int:
-        """List의 길이를 반환합니다."""
         raise NotImplementedError
 
     # ─────────────────────────────────────────
@@ -183,23 +226,18 @@ class DataStore:
     # ─────────────────────────────────────────
 
     def sadd(self, key: str, *members: str) -> int:
-        """Set에 멤버를 추가합니다. 반환: 새로 추가된 수"""
         raise NotImplementedError
 
     def srem(self, key: str, *members: str) -> int:
-        """Set에서 멤버를 삭제합니다. 반환: 삭제된 수"""
         raise NotImplementedError
 
     def smembers(self, key: str) -> set:
-        """Set의 모든 멤버를 반환합니다."""
         raise NotImplementedError
 
     def sismember(self, key: str, member: str) -> bool:
-        """Set에 멤버가 존재하는지 확인합니다."""
         raise NotImplementedError
 
     def scard(self, key: str) -> int:
-        """Set의 멤버 수를 반환합니다."""
         raise NotImplementedError
 
     # ─────────────────────────────────────────
@@ -207,26 +245,16 @@ class DataStore:
     # ─────────────────────────────────────────
 
     def zadd(self, key: str, score: float, member: str) -> int:
-        """
-        Sorted Set에 멤버를 추가합니다.
-        반환: 새로 추가되면 1, 업데이트면 0
-        """
         raise NotImplementedError
 
     def zrem(self, key: str, member: str) -> int:
-        """Sorted Set에서 멤버를 삭제합니다. 반환: 삭제된 수"""
         raise NotImplementedError
 
     def zscore(self, key: str, member: str) -> Optional[float]:
-        """멤버의 score를 반환합니다. 없으면 None."""
         raise NotImplementedError
 
     def zrange(self, key: str, start: int, stop: int) -> List[str]:
-        """
-        score 오름차순으로 start~stop 범위의 멤버를 반환합니다.
-        """
         raise NotImplementedError
 
     def zrank(self, key: str, member: str) -> Optional[int]:
-        """score 오름차순 기준 멤버의 순위(0부터)를 반환합니다."""
         raise NotImplementedError
