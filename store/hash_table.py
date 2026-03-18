@@ -1,14 +1,18 @@
-"""Custom hash structures used by the hash object path.
+"""
+커스텀 Redis-like hash 구조 구현.
 
-Small hashes stay compact for a while and then promote into an open-addressed
-table. The file is store-facing and does not expose Redis commands directly.
+- seed 정책: MurmurHash3 seed는 항상 0을 사용한다.
+- compact 표현: 작은 hash는 (field, value) 튜플 리스트로 저장한다.
+- 런타임 hashtable 표현: Separate Chaining을 사용한다.
+- Open Addressing 구현은 성능 비교와 회귀 테스트용으로 함께 유지한다.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from functools import lru_cache
+from typing import List, Optional, Tuple, Union
 
 
 MURMURHASH3_SEED = 0
@@ -23,23 +27,10 @@ SLOT_OCCUPIED = 1
 SLOT_TOMBSTONE = 2
 
 
-def murmurhash3_32(value: Union[str, bytes], seed: int = MURMURHASH3_SEED) -> int:
-    """
-    MurmurHash3 x86 32-bit 구현.
-
-    이 프로젝트의 hash 경로는 seed 0을 기본 정책으로 사용한다.
-    """
-    if seed != MURMURHASH3_SEED:
-        raise ValueError("MurmurHash3 seed policy is fixed to 0")
-
-    if isinstance(value, str):
-        data = value.encode("utf-8")
-    else:
-        data = value
-
+def _murmurhash3_32_bytes(data: bytes) -> int:
     length = len(data)
     nblocks = length // 4
-    h1 = seed & 0xFFFFFFFF
+    h1 = MURMURHASH3_SEED & 0xFFFFFFFF
     c1 = 0xCC9E2D51
     c2 = 0x1B873593
 
@@ -76,32 +67,51 @@ def murmurhash3_32(value: Union[str, bytes], seed: int = MURMURHASH3_SEED) -> in
     return h1 & 0xFFFFFFFF
 
 
+@lru_cache(maxsize=65536)
+def _murmurhash3_32_str_cached(value: str) -> int:
+    return _murmurhash3_32_bytes(value.encode("utf-8"))
+
+
+def murmurhash3_32(value: Union[str, bytes], seed: int = MURMURHASH3_SEED) -> int:
+    """
+    MurmurHash3 x86 32-bit 구현.
+
+    이 프로젝트의 hash 경로는 seed 0을 기본 정책으로 사용한다.
+    """
+    if seed != MURMURHASH3_SEED:
+        raise ValueError("MurmurHash3 seed policy is fixed to 0")
+
+    if isinstance(value, str):
+        return _murmurhash3_32_str_cached(value)
+    return _murmurhash3_32_bytes(value)
+
+
 class BaseHashTable(ABC):
     """공통 hash table 인터페이스."""
 
     @abstractmethod
     def set(self, key: str, value: str) -> bool:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def get(self, key: str) -> str | None:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def delete(self, key: str) -> bool:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def contains(self, key: str) -> bool:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def items(self) -> List[Tuple[str, str]]:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def __len__(self) -> int:
-        ...
+        raise NotImplementedError
 
 
 @dataclass
@@ -271,6 +281,196 @@ class OpenAddressHashTable(BaseHashTable):
                 result.append((slot.key, slot.value))
         return result
 
+    def flat_items(self) -> List[str]:
+        result: List[str] = []
+        for slot in self.slots:
+            if slot.state == SLOT_OCCUPIED:
+                result.append(slot.key)
+                result.append(slot.value)
+        return result
+
+    def keys(self) -> List[str]:
+        result: List[str] = []
+        for slot in self.slots:
+            if slot.state == SLOT_OCCUPIED:
+                result.append(slot.key)
+        return result
+
+    def values(self) -> List[str]:
+        result: List[str] = []
+        for slot in self.slots:
+            if slot.state == SLOT_OCCUPIED:
+                result.append(slot.value)
+        return result
+
+    def __len__(self) -> int:
+        return self.live_count
+
+
+@dataclass
+class _ChainNode:
+    hash_code: int
+    key: str
+    value: str
+    next: Optional["_ChainNode"] = None
+
+
+class ChainedHashTable(BaseHashTable):
+    """
+    Separate Chaining 기반 hash table.
+
+    - capacity는 power-of-two를 유지해 bucket 계산을 단순화한다.
+    - 각 bucket은 연결 리스트 head를 가진다.
+    - load factor는 live_count / capacity로 계산한다.
+    - resize 시 live entry만 새 bucket 배열에 재삽입한다.
+    """
+
+    def __init__(self, capacity: int = INITIAL_CAPACITY):
+        if capacity < INITIAL_CAPACITY:
+            capacity = INITIAL_CAPACITY
+        if capacity & (capacity - 1):
+            raise ValueError("capacity must be a power of two")
+
+        self.capacity = capacity
+        self.live_count = 0
+        self.buckets: List[Optional[_ChainNode]] = [None] * self.capacity
+
+    def _hash(self, key: str) -> int:
+        return murmurhash3_32(key)
+
+    def _bucket_index(self, hash_code: int) -> int:
+        return hash_code & (self.capacity - 1)
+
+    def _needs_grow_after_insert(self) -> bool:
+        return (self.live_count / self.capacity) > MAX_LOAD_FACTOR
+
+    def _needs_shrink_after_delete(self) -> bool:
+        return (
+            self.capacity > INITIAL_CAPACITY
+            and (self.live_count / self.capacity) < MIN_LOAD_FACTOR
+        )
+
+    def _insert_rehashed(self, hash_code: int, key: str, value: str) -> None:
+        index = self._bucket_index(hash_code)
+        node = _ChainNode(hash_code=hash_code, key=key, value=value, next=self.buckets[index])
+        self.buckets[index] = node
+        self.live_count += 1
+
+    def _resize(self, new_capacity: int) -> None:
+        if new_capacity < INITIAL_CAPACITY:
+            new_capacity = INITIAL_CAPACITY
+        if new_capacity & (new_capacity - 1):
+            raise ValueError("new_capacity must be a power of two")
+
+        old_buckets = self.buckets
+        self.capacity = new_capacity
+        self.live_count = 0
+        self.buckets = [None] * self.capacity
+
+        for bucket in old_buckets:
+            current = bucket
+            while current is not None:
+                self._insert_rehashed(current.hash_code, current.key, current.value)
+                current = current.next
+
+    def set(self, key: str, value: str) -> bool:
+        hash_code = self._hash(key)
+        index = self._bucket_index(hash_code)
+
+        current = self.buckets[index]
+        while current is not None:
+            if current.hash_code == hash_code and current.key == key:
+                current.value = value
+                return False
+            current = current.next
+
+        self.buckets[index] = _ChainNode(
+            hash_code=hash_code,
+            key=key,
+            value=value,
+            next=self.buckets[index],
+        )
+        self.live_count += 1
+
+        if self._needs_grow_after_insert():
+            self._resize(self.capacity * 2)
+
+        return True
+
+    def get(self, key: str) -> str | None:
+        hash_code = self._hash(key)
+        index = self._bucket_index(hash_code)
+
+        current = self.buckets[index]
+        while current is not None:
+            if current.hash_code == hash_code and current.key == key:
+                return current.value
+            current = current.next
+        return None
+
+    def delete(self, key: str) -> bool:
+        hash_code = self._hash(key)
+        index = self._bucket_index(hash_code)
+
+        previous: Optional[_ChainNode] = None
+        current = self.buckets[index]
+        while current is not None:
+            if current.hash_code == hash_code and current.key == key:
+                if previous is None:
+                    self.buckets[index] = current.next
+                else:
+                    previous.next = current.next
+                self.live_count -= 1
+
+                if self._needs_shrink_after_delete():
+                    self._resize(max(INITIAL_CAPACITY, self.capacity // 2))
+                return True
+
+            previous = current
+            current = current.next
+
+        return False
+
+    def contains(self, key: str) -> bool:
+        return self.get(key) is not None
+
+    def items(self) -> List[Tuple[str, str]]:
+        result: List[Tuple[str, str]] = []
+        for bucket in self.buckets:
+            current = bucket
+            while current is not None:
+                result.append((current.key, current.value))
+                current = current.next
+        return result
+
+    def flat_items(self) -> List[str]:
+        result: List[str] = []
+        for bucket in self.buckets:
+            current = bucket
+            while current is not None:
+                result.append(current.key)
+                result.append(current.value)
+                current = current.next
+        return result
+
+    def keys(self) -> List[str]:
+        result: List[str] = []
+        for bucket in self.buckets:
+            current = bucket
+            while current is not None:
+                result.append(current.key)
+                current = current.next
+        return result
+
+    def values(self) -> List[str]:
+        result: List[str] = []
+        for bucket in self.buckets:
+            current = bucket
+            while current is not None:
+                result.append(current.value)
+                current = current.next
+        return result
+
     def __len__(self) -> int:
         return self.live_count
 
@@ -288,7 +488,7 @@ class Hash:
 
     def __init__(self):
         self._compact_entries: List[Tuple[str, str]] = []
-        self._table: OpenAddressHashTable | None = None
+        self._table: BaseHashTable | None = None
 
     @property
     def is_compact(self) -> bool:
@@ -312,7 +512,7 @@ class Hash:
         if self._table is not None:
             return
 
-        self._table = OpenAddressHashTable()
+        self._table = ChainedHashTable()
         for key, value in self._compact_entries:
             self._table.set(key, value)
         self._compact_entries = []
@@ -364,6 +564,26 @@ class Hash:
         if self._table is not None:
             return self._table.items()
         return list(self._compact_entries)
+
+    def flat_items(self) -> List[str]:
+        if self._table is not None:
+            return self._table.flat_items()
+
+        result: List[str] = []
+        for key, value in self._compact_entries:
+            result.append(key)
+            result.append(value)
+        return result
+
+    def keys(self) -> List[str]:
+        if self._table is not None:
+            return self._table.keys()
+        return [key for key, _ in self._compact_entries]
+
+    def values(self) -> List[str]:
+        if self._table is not None:
+            return self._table.values()
+        return [value for _, value in self._compact_entries]
 
     def __len__(self) -> int:
         if self._table is not None:
