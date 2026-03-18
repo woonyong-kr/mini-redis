@@ -1,0 +1,96 @@
+services:
+
+  # ── 1. 실제 Redis (공식 이미지) ──────────────────────────────────
+  redis-official:
+    image: redis:7-alpine
+    container_name: redis-official
+    ports:
+      - "${REDIS_OFFICIAL_HOST_PORT:-6379}:6379"
+    # 데이터 볼륨 없음 → 컨테이너 종료 시 데이터 소멸
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - ${REDIS_APPENDONLY:-no}
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-0}
+      - --maxmemory-policy
+      - ${REDIS_MAXMEMORY_POLICY:-noeviction}
+    networks:
+      - bench-net
+
+  # ── 2. 직접 만든 mini-redis ───────────────────────────────────────
+  mini-redis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mini-redis
+    ports:
+      - "${MINI_REDIS_HOST_PORT:-6380}:${MINI_REDIS_SERVER_PORT:-6379}"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MINI_REDIS_HOST: ${MINI_REDIS_HOST:-0.0.0.0}
+      MINI_REDIS_PORT: ${MINI_REDIS_SERVER_PORT:-6379}
+      MINI_REDIS_READ_CHUNK: ${MINI_REDIS_READ_CHUNK:-4096}
+      MINI_REDIS_EXPIRY_LOOP_INTERVAL_MS: ${MINI_REDIS_EXPIRY_LOOP_INTERVAL_MS:-100}
+      MINI_REDIS_LOG_LEVEL: ${MINI_REDIS_LOG_LEVEL:-INFO}
+    networks:
+      - bench-net
+
+  # ── 3. MongoDB (비교용 - 영속성 DB) ──────────────────────────────
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    # 볼륨 없음 → 종료 시 데이터 소멸
+    environment:
+      MONGO_INITDB_DATABASE: bench
+    networks:
+      - bench-net
+
+  # ── 4. 벤치마크 봇 (테스트 실행기) ──────────────────────────────
+  benchmark:
+    build:
+      context: ./benchmark
+      dockerfile: Dockerfile
+    container_name: benchmark
+    depends_on:
+      - redis-official
+      - mini-redis
+      - mongodb
+    environment:
+      PYTHONUNBUFFERED: "1"
+      REDIS_OFFICIAL_HOST: ${BENCH_REDIS_OFFICIAL_HOST:-redis-official}
+      REDIS_OFFICIAL_PORT: ${BENCH_REDIS_OFFICIAL_PORT:-6379}
+      MINI_REDIS_HOST: ${BENCH_MINI_REDIS_HOST:-mini-redis}
+      MINI_REDIS_PORT: ${BENCH_MINI_REDIS_PORT:-6379}
+      MONGO_HOST: ${BENCH_MONGO_HOST:-mongodb}
+      MONGO_PORT: ${BENCH_MONGO_PORT:-27017}
+      BENCH_ITERATIONS: ${BENCH_ITERATIONS:-1000}
+      BENCH_WARMUP: ${BENCH_WARMUP:-100}
+      BENCH_PIPELINE_BATCH: ${BENCH_PIPELINE_BATCH:-100}
+      BENCH_TTL_SECONDS: ${BENCH_TTL_SECONDS:-60}
+      BENCH_VALUE_SIZE: ${BENCH_VALUE_SIZE:-32}
+      BENCH_CACHE_KEY_COUNT: ${BENCH_CACHE_KEY_COUNT:-100}
+      BENCH_SESSION_COUNT: ${BENCH_SESSION_COUNT:-100}
+      BENCH_RATE_USER_COUNT: ${BENCH_RATE_USER_COUNT:-50}
+      BENCH_QUEUE_COUNT: ${BENCH_QUEUE_COUNT:-5}
+      BENCH_LEADERBOARD_PLAYERS: ${BENCH_LEADERBOARD_PLAYERS:-500}
+      BENCH_CACHE_HIT_KEYS: ${BENCH_CACHE_HIT_KEYS:-100}
+      BENCH_PUBSUB_ITERATIONS: ${BENCH_PUBSUB_ITERATIONS:-200}
+      BENCH_STARTUP_DELAY_SECONDS: ${BENCH_STARTUP_DELAY_SECONDS:-3}
+      BENCH_SOCKET_TIMEOUT_SECONDS: ${BENCH_SOCKET_TIMEOUT_SECONDS:-5}
+      BENCH_RANDOM_SEED: ${BENCH_RANDOM_SEED:-}
+    volumes:
+      - ./benchmark/results:/app/results   # 결과 JSON/CSV 파일 저장
+    networks:
+      - bench-net
+    # 서비스들이 준비될 때까지 잠깐 대기 후 실행
+    command: >
+      sh -c "sleep ${BENCH_STARTUP_DELAY_SECONDS:-3} && python -u benchmark.py"
+
+networks:
+  bench-net:
+    driver: bridge

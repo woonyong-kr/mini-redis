@@ -17,6 +17,7 @@ from protocol.encoder import RespError, SimpleString, encode
 from store.datastore import DataStore, TYPE_NONE
 from store.expiry import ExpiryManager
 from store.hash_table import Hash
+from store.redis_object import make_string
 
 
 @pytest.fixture
@@ -94,7 +95,9 @@ class TestHashCommands:
                 store, expiry, ["big-hash", f"field-{index}", f"value-{index}"]
             ) == 1
 
-        hash_value = store.get("big-hash")
+        hash_obj = store.get("big-hash")
+        assert hash_obj is not None
+        hash_value = hash_obj.value
         assert isinstance(hash_value, Hash)
         assert hash_value.is_compact is False
         assert cmd_hlen(store, expiry, ["big-hash"]) == 33
@@ -108,14 +111,16 @@ class TestHashCommands:
         large_value = "x" * 65
         assert cmd_hset(store, expiry, ["large-hash", "field", large_value]) == 1
 
-        hash_value = store.get("large-hash")
+        hash_obj = store.get("large-hash")
+        assert hash_obj is not None
+        hash_value = hash_obj.value
         assert isinstance(hash_value, Hash)
         assert hash_value.is_compact is False
         assert cmd_hget(store, expiry, ["large-hash", "field"]) == large_value
 
     def test_wrongtype_error_for_hash_commands(self, ctx):
         store, expiry = ctx
-        store.set("plain", "string-value")
+        store.set("plain", make_string("string-value"))
 
         result = cmd_hget(store, expiry, ["plain", "field"])
 

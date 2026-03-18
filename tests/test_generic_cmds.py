@@ -14,6 +14,7 @@ from commands.generic_cmds import (
 from protocol.encoder import RespError, encode
 from store.datastore import DataStore
 from store.expiry import ExpiryManager
+from store.redis_object import make_string
 
 
 @pytest.fixture
@@ -42,8 +43,8 @@ class TestPing:
 class TestDeleteAndExists:
     def test_del_counts_deleted_keys(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
-        store.set("baz", "qux")
+        store.set("foo", make_string("bar"))
+        store.set("baz", make_string("qux"))
 
         assert cmd_del(store, expiry, ["foo", "missing", "baz"]) == 2
         assert store.exists("foo") is False
@@ -51,7 +52,7 @@ class TestDeleteAndExists:
 
     def test_exists_counts_duplicates(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
+        store.set("foo", make_string("bar"))
 
         assert cmd_exists(store, expiry, ["foo", "foo", "missing"]) == 2
 
@@ -59,7 +60,7 @@ class TestDeleteAndExists:
 class TestExpiryCommands:
     def test_expire_ttl_and_persist_flow(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
+        store.set("foo", make_string("bar"))
 
         assert cmd_ttl(store, expiry, ["foo"]) == -1
         assert cmd_expire(store, expiry, ["foo", "100"]) == 1
@@ -75,7 +76,7 @@ class TestExpiryCommands:
 
     def test_expire_rejects_non_integer(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
+        store.set("foo", make_string("bar"))
 
         result = cmd_expire(store, expiry, ["foo", "abc"])
         assert isinstance(result, RespError)
@@ -83,7 +84,7 @@ class TestExpiryCommands:
 
     def test_ttl_treats_expired_key_as_missing(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
+        store.set("foo", make_string("bar"))
         expiry.set_expiry("foo", -1)
 
         assert cmd_ttl(store, expiry, ["foo"]) == -2
@@ -91,7 +92,7 @@ class TestExpiryCommands:
 
     def test_delete_cleans_up_expiry_metadata(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
+        store.set("foo", make_string("bar"))
         expiry.set_expiry("foo", 100)
 
         assert cmd_del(store, expiry, ["foo"]) == 1
@@ -101,9 +102,9 @@ class TestExpiryCommands:
 class TestTypeKeysFlushall:
     def test_type_and_keys_filter_expired_entries(self, ctx):
         store, expiry = ctx
-        store.set("plain", "text")
+        store.set("plain", make_string("text"))
         store.hset("user:1", "name", "alice")
-        store.set("temp", "gone")
+        store.set("temp", make_string("gone"))
         expiry.set_expiry("temp", -1)
 
         assert encode(cmd_type(store, expiry, ["plain"])) == b"+string\r\n"
@@ -114,8 +115,8 @@ class TestTypeKeysFlushall:
 
     def test_flushall_clears_store_and_expiry(self, ctx):
         store, expiry = ctx
-        store.set("foo", "bar")
-        store.set("bar", "baz")
+        store.set("foo", make_string("bar"))
+        store.set("bar", make_string("baz"))
         expiry.set_expiry("foo", 100)
         expiry.set_expiry("bar", 100)
 

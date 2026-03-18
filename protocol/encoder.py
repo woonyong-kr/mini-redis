@@ -14,6 +14,9 @@ RESP 타입 요약:
 
 from typing import Optional, List, Any
 
+RESP_ENCODING = "utf-8"
+RESP_ERRORS = "surrogateescape"
+
 
 # ─────────────────────────────────────────────────────────────────
 # 응답 타입 래퍼 클래스
@@ -80,7 +83,7 @@ def encode_simple_string(s: str) -> bytes:
     """
     # RESP Simple String 형식: + 접두사 + 내용 + \r\n (줄끝 표시)
     # f-string으로 문자열을 조립한 뒤 .encode()로 바이트로 변환
-    return f"+{s}\r\n".encode()
+    return f"+{s}\r\n".encode(RESP_ENCODING, errors=RESP_ERRORS)
 
 
 def encode_error(msg: str) -> bytes:
@@ -92,7 +95,7 @@ def encode_error(msg: str) -> bytes:
     redis-py는 - 로 시작하는 응답을 받으면 예외(Exception)를 발생시킵니다.
     """
     # RESP Error 형식: - 접두사 + 메시지 + \r\n
-    return f"-{msg}\r\n".encode()
+    return f"-{msg}\r\n".encode(RESP_ENCODING, errors=RESP_ERRORS)
 
 
 def encode_integer(n: int) -> bytes:
@@ -103,7 +106,7 @@ def encode_integer(n: int) -> bytes:
     INCR, DEL, LLEN 등 숫자를 반환하는 명령어에 사용됩니다.
     """
     # RESP Integer 형식: : 접두사 + 숫자 + \r\n
-    return f":{n}\r\n".encode()
+    return f":{n}\r\n".encode(RESP_ENCODING, errors=RESP_ERRORS)
 
 
 def encode_bulk_string(s: Optional[str]) -> bytes:
@@ -123,11 +126,11 @@ def encode_bulk_string(s: Optional[str]) -> bytes:
 
     # 문자열을 바이트로 변환 (길이 계산을 위해)
     # 한글 등 멀티바이트 문자는 문자 수와 바이트 수가 다르므로 encode() 후 길이를 재야 함
-    encoded = s.encode()
+    encoded = s.encode(RESP_ENCODING, errors=RESP_ERRORS)
 
     # RESP Bulk String 형식: $ + 바이트 길이 + \r\n + 실제 내용 + \r\n
     # 예) "hello" → $5\r\nhello\r\n
-    return f"${len(encoded)}\r\n".encode() + encoded + b"\r\n"
+    return f"${len(encoded)}\r\n".encode(RESP_ENCODING, errors=RESP_ERRORS) + encoded + b"\r\n"
 
 
 def encode_array(items: List[Any]) -> bytes:
@@ -145,7 +148,7 @@ def encode_array(items: List[Any]) -> bytes:
 
     # RESP Array 헤더: * + 원소 개수 + \r\n
     # 예) 원소가 2개면 → *2\r\n
-    result = f"*{len(items)}\r\n".encode()
+    result = f"*{len(items)}\r\n".encode(RESP_ENCODING, errors=RESP_ERRORS)
 
     # 각 원소를 타입에 맞게 인코딩해서 이어붙임
     for item in items:

@@ -25,12 +25,7 @@ def _type_check(store: DataStore, key: str) -> RespError | None:
 
 
 def _get_hash_object(store: DataStore, key: str) -> Hash | None:
-    value = store.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, Hash):
-        raise TypeError(WRONGTYPE_ERROR)
-    return value
+    return store._get_hash_table(key)
 
 
 def cmd_hset(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
