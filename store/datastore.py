@@ -15,6 +15,7 @@ from store.hash_table import Hash
 from store.redis_object import (
     RedisObject,
     TYPE_STRING, TYPE_HASH, TYPE_LIST, TYPE_SET, TYPE_ZSET, TYPE_NONE,
+    make_list, make_set, make_zset,
 )
 
 
@@ -142,7 +143,6 @@ class DataStore:
         if isinstance(obj.value, Hash):
             return obj.value
 
-        # 원격 dev의 dict 기반 hash와도 호환되도록 lazy migration 지원
         migrated = Hash()
         if isinstance(obj.value, dict):
             for field, value in obj.value.items():
@@ -150,6 +150,68 @@ class DataStore:
         obj.value = migrated
         obj.encoding = "hashtable"
         return migrated
+
+    def _get_list_object(self, key: str, create: bool = False) -> Optional[RedisObject]:
+        obj = self.get(key)
+        if obj is None:
+            if not create:
+                return None
+            obj = make_list()
+            self._data[key] = obj
+            return obj
+
+        if obj.type != TYPE_LIST:
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return obj
+
+    def _get_set_object(self, key: str, create: bool = False) -> Optional[RedisObject]:
+        obj = self.get(key)
+        if obj is None:
+            if not create:
+                return None
+            obj = make_set()
+            self._data[key] = obj
+            return obj
+
+        if obj.type != TYPE_SET:
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return obj
+
+    def _get_zset_object(self, key: str, create: bool = False) -> Optional[RedisObject]:
+        obj = self.get(key)
+        if obj is None:
+            if not create:
+                return None
+            obj = make_zset()
+            self._data[key] = obj
+            return obj
+
+        if obj.type != TYPE_ZSET:
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return obj
+
+    @staticmethod
+    def _normalize_range(length: int, start: int, stop: int) -> Optional[tuple[int, int]]:
+        if length == 0:
+            return None
+
+        if start < 0:
+            start += length
+        if stop < 0:
+            stop += length
+
+        if start < 0:
+            start = 0
+        if stop < 0:
+            return None
+        if start >= length:
+            return None
+        if stop >= length:
+            stop = length - 1
+        if start > stop:
+            return None
+
+        return start, stop
 
     def hget(self, key: str, field: str) -> Optional[str]:
         """Hash에서 특정 필드의 값을 반환합니다."""
@@ -204,57 +266,148 @@ class DataStore:
     # ─────────────────────────────────────────
 
     def lpush(self, key: str, *values: str) -> int:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key, create=True)
+        for value in values:
+            list_obj.value.appendleft(value)
+        return len(list_obj.value)
 
     def rpush(self, key: str, *values: str) -> int:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key, create=True)
+        for value in values:
+            list_obj.value.append(value)
+        return len(list_obj.value)
 
     def lpop(self, key: str) -> Optional[str]:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key)
+        if list_obj is None or not list_obj.value:
+            return None
+
+        value = list_obj.value.popleft()
+        if not list_obj.value:
+            self.delete(key)
+        return value
 
     def rpop(self, key: str) -> Optional[str]:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key)
+        if list_obj is None or not list_obj.value:
+            return None
+
+        value = list_obj.value.pop()
+        if not list_obj.value:
+            self.delete(key)
+        return value
 
     def lrange(self, key: str, start: int, stop: int) -> List[str]:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key)
+        if list_obj is None:
+            return []
+
+        values = list(list_obj.value)
+        normalized = self._normalize_range(len(values), start, stop)
+        if normalized is None:
+            return []
+
+        range_start, range_stop = normalized
+        return values[range_start:range_stop + 1]
 
     def llen(self, key: str) -> int:
-        raise NotImplementedError
+        list_obj = self._get_list_object(key)
+        if list_obj is None:
+            return 0
+        return len(list_obj.value)
 
     # ─────────────────────────────────────────
     # Set 전용 메서드
     # ─────────────────────────────────────────
 
     def sadd(self, key: str, *members: str) -> int:
-        raise NotImplementedError
+        set_obj = self._get_set_object(key, create=True)
+        added = 0
+        for member in members:
+            if member not in set_obj.value:
+                set_obj.value.add(member)
+                added += 1
+        return added
 
     def srem(self, key: str, *members: str) -> int:
-        raise NotImplementedError
+        set_obj = self._get_set_object(key)
+        if set_obj is None:
+            return 0
+
+        removed = 0
+        for member in members:
+            if member in set_obj.value:
+                set_obj.value.remove(member)
+                removed += 1
+
+        if not set_obj.value:
+            self.delete(key)
+        return removed
 
     def smembers(self, key: str) -> set:
-        raise NotImplementedError
+        set_obj = self._get_set_object(key)
+        if set_obj is None:
+            return set()
+        return set(set_obj.value)
 
     def sismember(self, key: str, member: str) -> bool:
-        raise NotImplementedError
+        set_obj = self._get_set_object(key)
+        if set_obj is None:
+            return False
+        return member in set_obj.value
 
     def scard(self, key: str) -> int:
-        raise NotImplementedError
+        set_obj = self._get_set_object(key)
+        if set_obj is None:
+            return 0
+        return len(set_obj.value)
 
     # ─────────────────────────────────────────
     # Sorted Set 전용 메서드
     # ─────────────────────────────────────────
 
     def zadd(self, key: str, score: float, member: str) -> int:
-        raise NotImplementedError
+        zset_obj = self._get_zset_object(key, create=True)
+        added = 0 if member in zset_obj.value else 1
+        zset_obj.value[member] = score
+        return added
 
     def zrem(self, key: str, member: str) -> int:
-        raise NotImplementedError
+        zset_obj = self._get_zset_object(key)
+        if zset_obj is None or member not in zset_obj.value:
+            return 0
+
+        del zset_obj.value[member]
+        if not zset_obj.value:
+            self.delete(key)
+        return 1
 
     def zscore(self, key: str, member: str) -> Optional[float]:
-        raise NotImplementedError
+        zset_obj = self._get_zset_object(key)
+        if zset_obj is None:
+            return None
+        return zset_obj.value.get(member)
 
     def zrange(self, key: str, start: int, stop: int) -> List[str]:
-        raise NotImplementedError
+        zset_obj = self._get_zset_object(key)
+        if zset_obj is None:
+            return []
+
+        sorted_members = sorted(zset_obj.value.items(), key=lambda item: (item[1], item[0]))
+        normalized = self._normalize_range(len(sorted_members), start, stop)
+        if normalized is None:
+            return []
+
+        range_start, range_stop = normalized
+        return [member for member, _ in sorted_members[range_start:range_stop + 1]]
 
     def zrank(self, key: str, member: str) -> Optional[int]:
-        raise NotImplementedError
+        zset_obj = self._get_zset_object(key)
+        if zset_obj is None or member not in zset_obj.value:
+            return None
+
+        sorted_members = sorted(zset_obj.value.items(), key=lambda item: (item[1], item[0]))
+        for index, (current_member, _) in enumerate(sorted_members):
+            if current_member == member:
+                return index
+        return None
