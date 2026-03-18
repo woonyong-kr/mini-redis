@@ -150,33 +150,99 @@ class DataStore:
         List 왼쪽에 값을 추가합니다.
         반환: 추가 후 리스트 길이
         """
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            obj = make_list()
+            self._data[key] = obj
+
+        dq = obj.value
+        for value in values:
+            dq.appendleft(value)
+        return len(dq)
 
     def rpush(self, key: str, *values: str) -> int:
         """
         List 오른쪽에 값을 추가합니다.
         반환: 추가 후 리스트 길이
         """
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            obj = make_list()
+            self._data[key] = obj
+
+        dq = obj.value
+        for value in values:
+            dq.append(value)
+        return len(dq)
 
     def lpop(self, key: str) -> Optional[str]:
         """List 왼쪽에서 값을 꺼냅니다. 비어있으면 None."""
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            return None
+
+        dq = obj.value
+        if not dq:
+            return None
+
+        value = dq.popleft()
+        if not dq:
+            self.delete(key)
+        return value
 
     def rpop(self, key: str) -> Optional[str]:
         """List 오른쪽에서 값을 꺼냅니다. 비어있으면 None."""
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            return None
+
+        dq = obj.value
+        if not dq:
+            return None
+
+        value = dq.pop()
+        if not dq:
+            self.delete(key)
+        return value
 
     def lrange(self, key: str, start: int, stop: int) -> List[str]:
         """
         List의 start~stop 범위를 반환합니다.
         음수 인덱스 지원: -1은 마지막 원소
         """
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            return []
+
+        items = list(obj.value)
+        n = len(items)
+        if n == 0:
+            return []
+
+        if start < 0:
+            start += n
+        if stop < 0:
+            stop += n
+
+        if start < 0:
+            start = 0
+        if stop < 0:
+            return []
+        if start >= n:
+            return []
+        if stop >= n:
+            stop = n - 1
+        if start > stop:
+            return []
+
+        return items[start:stop + 1]
 
     def llen(self, key: str) -> int:
         """List의 길이를 반환합니다."""
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            return 0
+        return len(obj.value)
 
     # ─────────────────────────────────────────
     # Set 전용 메서드

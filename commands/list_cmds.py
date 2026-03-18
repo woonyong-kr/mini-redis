@@ -16,7 +16,16 @@ def cmd_lpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     왼쪽에 추가. 여러 값은 왼쪽부터 순서대로 추가됩니다.
     반환: 추가 후 리스트 길이 (integer)
     """
-    raise NotImplementedError
+    if len(args) < 2:
+        return RespError("ERR wrong number of arguments for 'LPUSH' command")
+
+    key = args[0]
+    values = args[1:]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    return store.lpush(key, *values)
 
 
 def cmd_rpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -25,7 +34,16 @@ def cmd_rpush(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     오른쪽에 추가.
     반환: 추가 후 리스트 길이 (integer)
     """
-    raise NotImplementedError
+    if len(args) < 2:
+        return RespError("ERR wrong number of arguments for 'RPUSH' command")
+
+    key = args[0]
+    values = args[1:]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    return store.rpush(key, *values)
 
 
 def cmd_lpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -34,7 +52,15 @@ def cmd_lpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     왼쪽에서 꺼냅니다.
     반환: 꺼낸 값 (bulk string) 또는 nil
     """
-    raise NotImplementedError
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'LPOP' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    return store.lpop(key)
 
 
 def cmd_rpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -43,7 +69,15 @@ def cmd_rpop(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     오른쪽에서 꺼냅니다.
     반환: 꺼낸 값 (bulk string) 또는 nil
     """
-    raise NotImplementedError
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'RPOP' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    return store.rpop(key)
 
 
 def cmd_lrange(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -53,7 +87,21 @@ def cmd_lrange(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     음수 인덱스 지원: -1은 마지막, -2는 끝에서 두 번째
     반환: 배열 (array)
     """
-    raise NotImplementedError
+    if len(args) != 3:
+        return RespError("ERR wrong number of arguments for 'LRANGE' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    try:
+        start = int(args[1])
+        stop = int(args[2])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.lrange(key, start, stop)
 
 
 def cmd_llen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
@@ -61,7 +109,15 @@ def cmd_llen(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     LLEN key
     반환: 리스트 길이 (integer). 키 없으면 0.
     """
-    raise NotImplementedError
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'LLEN' command")
+
+    key = args[0]
+
+    if store.exists(key) and store.get_type(key) != "list":
+        return RespError(WRONGTYPE_ERROR)
+
+    return store.llen(key)
 
 
 def cmd_lindex(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
