@@ -13,9 +13,13 @@ from protocol.encoder import SimpleString, RespError
 def cmd_ping(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
     """
     PING [message]
-    message 없으면 +PONG, 있으면 bulk string으로 message 반환.
+    message 없으면 SimpleString("PONG"), 있으면 message를 bulk string으로 반환.
     """
-    raise NotImplementedError
+    if len(args) > 1:
+        return RespError("ERR wrong number of arguments for 'ping' command")
+    if len(args) == 0:
+        return SimpleString("PONG")
+    return args[0]
 
 
 def cmd_del(store: DataStore, expiry: ExpiryManager, args: List[str]) -> Any:
