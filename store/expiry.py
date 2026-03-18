@@ -26,13 +26,14 @@ class ExpiryManager:
     def __init__(self, store: "DataStore"):
         self._store = store
         self._expiry: dict = {}
+        self._store.bind_expiry_manager(self)
 
     def set_expiry(self, key: str, seconds: float) -> None:
         """
         키의 만료 시간을 설정합니다.
         hints: time.time() + seconds를 만료 timestamp로 저장
         """
-        raise NotImplementedError
+        self._expiry[key] = time.time() + seconds
 
     def get_ttl(self, key: str) -> float:
         """
@@ -43,7 +44,19 @@ class ExpiryManager:
           - -2: 키가 존재하지 않음
         힌트: time.time()으로 현재 시각을 구하고 차이를 계산
         """
-        raise NotImplementedError
+        if not self._store.exists(key):
+            self._expiry.pop(key, None)
+            return -2
+
+        expiry_at = self._expiry.get(key)
+        if expiry_at is None:
+            return -1
+
+        remaining = expiry_at - time.time()
+        if remaining <= 0:
+            self._store.delete(key)
+            return -2
+        return remaining
 
     def is_expired(self, key: str) -> bool:
         """
@@ -51,21 +64,27 @@ class ExpiryManager:
         만료 시각이 없으면 False를 반환합니다.
         힌트: key가 _expiry에 없으면 False, 있으면 time.time() 비교
         """
-        raise NotImplementedError
+        expiry_at = self._expiry.get(key)
+        if expiry_at is None:
+            return False
+        if key not in self._store._data:
+            self._expiry.pop(key, None)
+            return False
+        return time.time() >= expiry_at
 
     def remove_expiry(self, key: str) -> None:
         """
         키의 만료 설정을 제거합니다. (PERSIST 명령어용)
         힌트: _expiry에서 key를 pop (없어도 에러 없게)
         """
-        raise NotImplementedError
+        self._expiry.pop(key, None)
 
     def on_key_deleted(self, key: str) -> None:
         """
         키가 삭제될 때 호출됩니다. 만료 정보도 함께 제거합니다.
         DataStore.delete()에서 이 메서드를 호출해야 합니다.
         """
-        raise NotImplementedError
+        self.remove_expiry(key)
 
     async def active_expiry_loop(self) -> None:
         """
@@ -77,4 +96,11 @@ class ExpiryManager:
               만료된 키들을 찾아서 삭제
               await asyncio.sleep(0.1)  # 0.1초마다 실행
         """
-        raise NotImplementedError
+        while True:
+            expired_keys = [
+                key for key, expiry_at in list(self._expiry.items())
+                if time.time() >= expiry_at
+            ]
+            for key in expired_keys:
+                self._store.delete(key)
+            await asyncio.sleep(0.1)

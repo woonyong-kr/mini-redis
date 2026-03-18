@@ -5,8 +5,15 @@
 각 메서드를 구현하세요. 메서드 이름과 파라미터는 변경하지 마세요.
 """
 
-from typing import Optional, Any, List
+from __future__ import annotations
+
+from fnmatch import fnmatch
+from typing import Optional, Any, List, TYPE_CHECKING
 from collections import deque
+from store.hash_table import Hash
+
+if TYPE_CHECKING:
+    from store.expiry import ExpiryManager
 
 
 # Redis 데이터 타입 상수
@@ -27,7 +34,7 @@ class DataStore:
                           {"key": value} 형태
                           value는 타입에 따라 다름:
                             string → str
-                            hash   → dict
+                            hash   → Hash
                             list   → deque
                             set    → set
                             zset   → dict {"member": score}
@@ -35,6 +42,17 @@ class DataStore:
 
     def __init__(self):
         self._data: dict = {}
+        self._expiry_manager: ExpiryManager | None = None
+
+    def bind_expiry_manager(self, expiry_manager: ExpiryManager) -> None:
+        """ExpiryManager를 연결합니다."""
+        self._expiry_manager = expiry_manager
+
+    def _purge_if_expired(self, key: str) -> None:
+        if self._expiry_manager is None:
+            return
+        if self._expiry_manager.is_expired(key):
+            self.delete(key)
 
     # ─────────────────────────────────────────
     # 범용 메서드
@@ -45,34 +63,44 @@ class DataStore:
         키에 저장된 값을 반환합니다.
         키가 없으면 None을 반환합니다.
         """
-        raise NotImplementedError
+        self._purge_if_expired(key)
+        return self._data.get(key)
 
     def set(self, key: str, value: Any) -> None:
         """
         키에 값을 저장합니다.
         기존 값이 있으면 덮어씁니다.
         """
-        raise NotImplementedError
+        self._data[key] = value
 
     def delete(self, key: str) -> int:
         """
         키를 삭제합니다.
         반환: 삭제된 키의 수 (1 또는 0)
         """
-        raise NotImplementedError
+        if key in self._data:
+            del self._data[key]
+            if self._expiry_manager is not None:
+                self._expiry_manager.on_key_deleted(key)
+            return 1
+        return 0
 
     def delete_many(self, keys: List[str]) -> int:
         """
         여러 키를 삭제합니다.
         반환: 실제로 삭제된 키의 수
         """
-        raise NotImplementedError
+        deleted = 0
+        for key in keys:
+            deleted += self.delete(key)
+        return deleted
 
     def exists(self, key: str) -> bool:
         """
         키의 존재 여부를 반환합니다.
         """
-        raise NotImplementedError
+        self._purge_if_expired(key)
+        return key in self._data
 
     def get_type(self, key: str) -> str:
         """
@@ -81,12 +109,26 @@ class DataStore:
 
         힌트: isinstance()로 Python 타입을 확인하세요.
           str → TYPE_STRING
-          dict → TYPE_HASH
+          Hash → TYPE_HASH
           deque → TYPE_LIST
           set → TYPE_SET
           (zset은 별도 처리 필요 - 어떻게 구분할지 생각해보세요)
         """
-        raise NotImplementedError
+        self._purge_if_expired(key)
+        value = self._data.get(key)
+        if value is None:
+            return TYPE_NONE
+        if isinstance(value, str):
+            return TYPE_STRING
+        if isinstance(value, Hash):
+            return TYPE_HASH
+        if isinstance(value, deque):
+            return TYPE_LIST
+        if isinstance(value, set):
+            return TYPE_SET
+        if isinstance(value, dict):
+            return TYPE_ZSET
+        return TYPE_NONE
 
     def keys(self, pattern: str = "*") -> List[str]:
         """
@@ -95,13 +137,22 @@ class DataStore:
 
         힌트: fnmatch 모듈 사용 가능
         """
-        raise NotImplementedError
+        if self._expiry_manager is not None:
+            for key in list(self._data.keys()):
+                self._purge_if_expired(key)
+
+        if pattern == "*":
+            return list(self._data.keys())
+        return [key for key in self._data.keys() if fnmatch(key, pattern)]
 
     def flush(self) -> None:
         """
         모든 데이터를 삭제합니다. (FLUSHALL)
         """
-        raise NotImplementedError
+        if self._expiry_manager is not None:
+            for key in list(self._data.keys()):
+                self._expiry_manager.on_key_deleted(key)
+        self._data.clear()
 
     # ─────────────────────────────────────────
     # Hash 전용 메서드
@@ -109,26 +160,61 @@ class DataStore:
 
     def hget(self, key: str, field: str) -> Optional[str]:
         """Hash에서 특정 필드의 값을 반환합니다."""
-        raise NotImplementedError
+        hash_value = self._data.get(key)
+        if hash_value is None:
+            return None
+        if not isinstance(hash_value, Hash):
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return hash_value.get(field)
 
     def hset(self, key: str, field: str, value: str) -> int:
         """
         Hash에 필드를 설정합니다.
         반환: 새로 추가된 필드면 1, 업데이트면 0
         """
-        raise NotImplementedError
+        hash_value = self._data.get(key)
+        if hash_value is None:
+            hash_value = Hash()
+            self._data[key] = hash_value
+        if not isinstance(hash_value, Hash):
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return 1 if hash_value.set(field, value) else 0
 
     def hdel(self, key: str, *fields: str) -> int:
         """Hash에서 필드를 삭제합니다. 반환: 삭제된 수"""
-        raise NotImplementedError
+        hash_value = self._data.get(key)
+        if hash_value is None:
+            return 0
+        if not isinstance(hash_value, Hash):
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+        deleted = 0
+        for field in fields:
+            if hash_value.delete(field):
+                deleted += 1
+
+        if len(hash_value) == 0:
+            self.delete(key)
+
+        return deleted
 
     def hgetall(self, key: str) -> dict:
         """Hash의 모든 필드와 값을 반환합니다."""
-        raise NotImplementedError
+        hash_value = self._data.get(key)
+        if hash_value is None:
+            return {}
+        if not isinstance(hash_value, Hash):
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return {field: value for field, value in hash_value.items()}
 
     def hexists(self, key: str, field: str) -> bool:
         """Hash에 필드가 존재하는지 확인합니다."""
-        raise NotImplementedError
+        hash_value = self._data.get(key)
+        if hash_value is None:
+            return False
+        if not isinstance(hash_value, Hash):
+            raise TypeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return hash_value.contains(field)
 
     # ─────────────────────────────────────────
     # List 전용 메서드
