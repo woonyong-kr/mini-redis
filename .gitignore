@@ -40,3 +40,8 @@ build/
 *.rdb
 dump.rdb
 appendonly.aof
+
+# Donghyun Codex용
+AGENTS.md
+IMPLEMENTATION_PROMPT.md
+README.md
