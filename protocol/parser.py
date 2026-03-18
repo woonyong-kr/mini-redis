@@ -20,6 +20,9 @@ Python 리스트로 변환합니다.
 
 from typing import Optional, Tuple, List
 
+RESP_ENCODING = "utf-8"
+RESP_ERRORS = "surrogateescape"
+
 
 def parse(data: bytes) -> Tuple[Optional[List[str]], int]:
     """
@@ -147,7 +150,7 @@ def _parse_bulk_string(data: bytes, pos: int) -> Tuple[Optional[str], int]:
 
     # start부터 end까지 슬라이싱해서 실제 문자열 추출
     # .decode()로 bytes → str 변환
-    value = data[start:end].decode()
+    value = data[start:end].decode(RESP_ENCODING, errors=RESP_ERRORS)
 
     # 다음 파싱 위치: 내용 끝 + \r\n (2바이트)
     return value, end + 2

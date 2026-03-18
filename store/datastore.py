@@ -5,17 +5,15 @@
 각 메서드를 구현하세요. 메서드 이름과 파라미터는 변경하지 마세요.
 """
 
-from typing import Optional, Any, List
+import fnmatch
 from collections import deque
+from typing import Optional, Any, List, Callable
 
-
-# Redis 데이터 타입 상수
-TYPE_STRING = "string"
-TYPE_HASH = "hash"
-TYPE_LIST = "list"
-TYPE_SET = "set"
-TYPE_ZSET = "zset"
-TYPE_NONE = "none"
+from store.redis_object import (
+    RedisObject,
+    TYPE_STRING, TYPE_HASH, TYPE_LIST, TYPE_SET, TYPE_ZSET, TYPE_NONE,
+    make_string, make_hash, make_list, make_set, make_zset,
+)
 
 
 class DataStore:
@@ -24,84 +22,97 @@ class DataStore:
 
     내부 구조:
       self._data: dict  - 실제 데이터 저장
-                          {"key": value} 형태
-                          value는 타입에 따라 다름:
-                            string → str
-                            hash   → dict
-                            list   → deque
-                            set    → set
-                            zset   → dict {"member": score}
+                          {"key": RedisObject} 형태
+                          RedisObject.type으로 Hash/ZSet 등 타입 구분 가능
     """
 
     def __init__(self):
-        self._data: dict = {}
+        # 키 → RedisObject 매핑
+        self._data: dict[str, RedisObject] = {}
+        self._delete_hooks: list[Callable[[str], None]] = []
 
     # ─────────────────────────────────────────
     # 범용 메서드
     # ─────────────────────────────────────────
 
-    def get(self, key: str) -> Optional[Any]:
+    def register_delete_hook(self, hook: Callable[[str], None]) -> None:
+        """키 삭제 시 호출할 훅을 등록합니다."""
+        self._delete_hooks.append(hook)
+
+    def get(self, key: str) -> Optional[RedisObject]:
         """
-        키에 저장된 값을 반환합니다.
+        키에 저장된 RedisObject를 반환합니다.
         키가 없으면 None을 반환합니다.
         """
-        raise NotImplementedError
+        return self._data.get(key)
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, obj: RedisObject) -> None:
         """
-        키에 값을 저장합니다.
+        키에 RedisObject를 저장합니다.
         기존 값이 있으면 덮어씁니다.
         """
-        raise NotImplementedError
+        self._data[key] = obj
 
     def delete(self, key: str) -> int:
         """
         키를 삭제합니다.
         반환: 삭제된 키의 수 (1 또는 0)
         """
-        raise NotImplementedError
+        if key in self._data:
+            del self._data[key]
+            for hook in self._delete_hooks:
+                hook(key)
+            return 1
+        return 0
 
     def delete_many(self, keys: List[str]) -> int:
         """
         여러 키를 삭제합니다.
         반환: 실제로 삭제된 키의 수
         """
-        raise NotImplementedError
+        count = 0
+        for key in keys:
+            count += self.delete(key)
+        return count
 
     def exists(self, key: str) -> bool:
         """
         키의 존재 여부를 반환합니다.
         """
-        raise NotImplementedError
+        return key in self._data
 
     def get_type(self, key: str) -> str:
         """
         키에 저장된 값의 Redis 타입을 반환합니다.
         반환값: "string" | "hash" | "list" | "set" | "zset" | "none"
 
-        힌트: isinstance()로 Python 타입을 확인하세요.
-          str → TYPE_STRING
-          dict → TYPE_HASH
-          deque → TYPE_LIST
-          set → TYPE_SET
-          (zset은 별도 처리 필요 - 어떻게 구분할지 생각해보세요)
+        RedisObject.type으로 바로 구분하므로 Hash/ZSet 혼동 없음.
         """
-        raise NotImplementedError
+        obj = self._data.get(key)
+        if obj is None:
+            return TYPE_NONE
+        return obj.type
 
     def keys(self, pattern: str = "*") -> List[str]:
         """
         패턴에 매칭되는 키 목록을 반환합니다.
         pattern="*" 이면 전체 키를 반환합니다.
 
-        힌트: fnmatch 모듈 사용 가능
+        fnmatch 모듈로 글로브 패턴 지원 (*, ?, [...])
         """
-        raise NotImplementedError
+        if pattern == "*":
+            return list(self._data.keys())
+        return [k for k in self._data if fnmatch.fnmatch(k, pattern)]
 
     def flush(self) -> None:
         """
         모든 데이터를 삭제합니다. (FLUSHALL)
         """
-        raise NotImplementedError
+        keys = list(self._data.keys())
+        self._data.clear()
+        for key in keys:
+            for hook in self._delete_hooks:
+                hook(key)
 
     # ─────────────────────────────────────────
     # Hash 전용 메서드
@@ -138,7 +149,6 @@ class DataStore:
         """
         List 왼쪽에 값을 추가합니다.
         반환: 추가 후 리스트 길이
-        힌트: deque.appendleft() 사용
         """
         raise NotImplementedError
 
@@ -146,7 +156,6 @@ class DataStore:
         """
         List 오른쪽에 값을 추가합니다.
         반환: 추가 후 리스트 길이
-        힌트: deque.append() 사용
         """
         raise NotImplementedError
 
@@ -162,7 +171,6 @@ class DataStore:
         """
         List의 start~stop 범위를 반환합니다.
         음수 인덱스 지원: -1은 마지막 원소
-        힌트: list(deque)[start:stop+1] 또는 itertools.islice
         """
         raise NotImplementedError
 
@@ -201,10 +209,7 @@ class DataStore:
     def zadd(self, key: str, score: float, member: str) -> int:
         """
         Sorted Set에 멤버를 추가합니다.
-        내부 구조: {"member": score} 딕셔너리
-
         반환: 새로 추가되면 1, 업데이트면 0
-        힌트: zset 타입은 TYPE_ZSET으로 별도 처리 필요
         """
         raise NotImplementedError
 
@@ -219,7 +224,6 @@ class DataStore:
     def zrange(self, key: str, start: int, stop: int) -> List[str]:
         """
         score 오름차순으로 start~stop 범위의 멤버를 반환합니다.
-        힌트: sorted(members, key=lambda m: score[m])
         """
         raise NotImplementedError
 
