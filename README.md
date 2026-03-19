@@ -564,13 +564,6 @@ pytest tests/test_server_integration.py -v
 
 ---
 
-## 문서
-
-- `docs/발표자료.md` — 발표 원고 (12개 섹션)
-- `docs/발표-치트시트.md` — 라이브 데모 대본 및 예상 질문 답변
-- `docs/cli-test-scenarios.md` — CLI 테스트 시나리오
-
----
 
 ## 현재 범위 밖인 기능
 
@@ -585,8 +578,3 @@ pytest tests/test_server_integration.py -v
 - Redis 원본 RDB 포맷 호환
 - RESP3 프로토콜
 
----
-
-## 라이선스
-
-이 저장소에는 별도의 LICENSE 파일이 아직 없습니다. 오픈소스로 배포할 경우 라이선스를 먼저 추가하는 것을 권장합니다.
